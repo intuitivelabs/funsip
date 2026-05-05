@@ -34,21 +34,115 @@ import (
 )
 
 type Options struct {
-	Symmetric bool
+	Symmetric   bool
+	IdleTimeout time.Duration
 }
 
+const DefaultIdleTimeout = 2 * time.Minute
+
 func DefaultOptions() Options {
-	return Options{Symmetric: true}
+	return Options{Symmetric: true, IdleTimeout: DefaultIdleTimeout}
 }
 
 type Manager struct {
 	localIP  string
 	sessions map[string]*Session
 	mu       sync.Mutex
+
+	sweepInterval time.Duration
+	stopSweep     chan struct{}
 }
 
 func NewManager(localIP string) *Manager {
-	return &Manager{localIP: localIP, sessions: make(map[string]*Session)}
+	m := &Manager{
+		localIP:       localIP,
+		sessions:      make(map[string]*Session),
+		sweepInterval: 5 * time.Second,
+		stopSweep:     make(chan struct{}),
+	}
+	go m.sweepLoop()
+	return m
+}
+
+// SetSweepInterval changes how often the manager checks for idle
+// streams. Intended for tests; production code should use the default.
+// The new interval takes effect on the next sweep cycle.
+func (m *Manager) SetSweepInterval(d time.Duration) {
+	m.sweepInterval = d
+}
+
+// SweepNow runs one synchronous sweep. Useful in tests to avoid
+// waiting on the periodic ticker.
+func (m *Manager) SweepNow() {
+	m.sweepIdle()
+}
+
+func (m *Manager) sweepLoop() {
+	for {
+		t := time.NewTimer(m.sweepInterval)
+		select {
+		case <-t.C:
+			m.sweepIdle()
+		case <-m.stopSweep:
+			t.Stop()
+			return
+		}
+	}
+}
+
+// sweepIdle closes streams that have not seen any RTP activity for
+// longer than their idleTimeout — but only if neither side of the
+// stream is on hold. Sessions whose streams are all closed are
+// removed from the map.
+func (m *Manager) sweepIdle() {
+	m.mu.Lock()
+	live := make([]*Session, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		live = append(live, s)
+	}
+	m.mu.Unlock()
+
+	now := time.Now().UnixNano()
+	for _, s := range live {
+		s.mu.Lock()
+		anyAlive := false
+		for _, st := range s.Streams {
+			if st.closed.Load() {
+				continue
+			}
+			if st.IsOnHold() {
+				anyAlive = true
+				continue
+			}
+			if st.idleTimeout > 0 {
+				last := st.lastActivity.Load()
+				if last > 0 && time.Duration(now-last) > st.idleTimeout {
+					log.Printf("[media] stream idle for >%v — releasing sockets", st.idleTimeout)
+					st.Close()
+					continue
+				}
+			}
+			anyAlive = true
+		}
+		s.mu.Unlock()
+
+		if !anyAlive {
+			m.mu.Lock()
+			if cur, ok := m.sessions[s.CallID]; ok && cur == s {
+				delete(m.sessions, s.CallID)
+			}
+			m.mu.Unlock()
+		}
+	}
+}
+
+// Stop terminates the sweeper goroutine. Used at server shutdown.
+func (m *Manager) Stop() {
+	select {
+	case <-m.stopSweep:
+	default:
+		close(m.stopSweep)
+	}
 }
 
 func (m *Manager) LocalIP() string { return m.localIP }
@@ -133,6 +227,8 @@ func (s *Session) AnchorOffer(in *sdp.SDP) error {
 			return err
 		}
 
+		stream.holdA.Store(isHold(m, in.Connection, in.Attributes))
+
 		if ip := net.ParseIP(addr); ip != nil {
 			stream.aSDPRTP.Store(&net.UDPAddr{IP: ip, Port: rtpPort})
 			stream.aSDPRTCP.Store(&net.UDPAddr{IP: ip, Port: rtcpPort})
@@ -172,6 +268,8 @@ func (s *Session) AnchorAnswer(in *sdp.SDP) error {
 		}
 		stream := s.Streams[i]
 
+		stream.holdB.Store(isHold(m, in.Connection, in.Attributes))
+
 		addr := sessionAddr
 		if m.Connection != nil {
 			addr = m.Connection.Address
@@ -210,7 +308,11 @@ func (s *Session) AnchorAnswer(in *sdp.SDP) error {
 
 func (s *Session) ensureStream(i int) (*Stream, error) {
 	for len(s.Streams) <= i {
-		stream := &Stream{symmetric: s.opts.Symmetric, done: make(chan struct{})}
+		stream := &Stream{
+			symmetric:   s.opts.Symmetric,
+			idleTimeout: s.opts.IdleTimeout,
+			done:        make(chan struct{}),
+		}
 		if err := stream.allocate(s.manager.localIP); err != nil {
 			return nil, err
 		}
@@ -218,6 +320,40 @@ func (s *Session) ensureStream(i int) (*Stream, error) {
 		stream.start()
 	}
 	return s.Streams[i], nil
+}
+
+// isHold returns true if the given media descriptor (with its
+// session-level fallbacks) marks the stream as on-hold per the
+// established conventions: a=sendonly, a=inactive, or c=0.0.0.0
+// (the deprecated marker).
+func isHold(m *sdp.Media, sessionConn *sdp.Connection, sessionAttrs []sdp.Attribute) bool {
+	dir := mediaDirection(m, sessionAttrs)
+	if dir == "sendonly" || dir == "inactive" {
+		return true
+	}
+	addr := ""
+	if m.Connection != nil {
+		addr = m.Connection.Address
+	} else if sessionConn != nil {
+		addr = sessionConn.Address
+	}
+	return addr == "0.0.0.0"
+}
+
+func mediaDirection(m *sdp.Media, sessionAttrs []sdp.Attribute) string {
+	for _, a := range m.Attributes {
+		switch a.Name {
+		case "sendrecv", "sendonly", "recvonly", "inactive":
+			return a.Name
+		}
+	}
+	for _, a := range sessionAttrs {
+		switch a.Name {
+		case "sendrecv", "sendonly", "recvonly", "inactive":
+			return a.Name
+		}
+	}
+	return "sendrecv"
 }
 
 func (s *Session) Close() {
@@ -247,9 +383,28 @@ type Stream struct {
 	aSrcRTP, aSrcRTCP atomic.Pointer[net.UDPAddr]
 	bSrcRTP, bSrcRTCP atomic.Pointer[net.UDPAddr]
 
+	// Idle release: lastActivity is updated on every received RTP/RTCP
+	// datagram. The sweeper closes the stream when (now - lastActivity)
+	// exceeds idleTimeout, unless either side has signalled hold.
+	lastActivity atomic.Int64
+	idleTimeout  time.Duration
+	holdA, holdB atomic.Bool
+
 	done   chan struct{}
 	closed atomic.Bool
 }
+
+// Closed reports whether the stream's UDP sockets have been released.
+// Safe to call concurrently.
+func (s *Stream) Closed() bool { return s.closed.Load() }
+
+// IsOnHold reports whether at least one side of the stream is in a
+// hold state (a=sendonly, a=inactive, or c=0.0.0.0).
+func (s *Stream) IsOnHold() bool { return s.holdA.Load() || s.holdB.Load() }
+
+// LastActivity returns the unix-nano timestamp of the last received
+// RTP/RTCP datagram. Useful for tests.
+func (s *Stream) LastActivity() int64 { return s.lastActivity.Load() }
 
 func (s *Stream) ARtpPort() int  { return s.aRtpPort }
 func (s *Stream) BRtpPort() int  { return s.bRtpPort }
@@ -271,6 +426,7 @@ func (s *Stream) allocate(localIP string) error {
 		*c = conn
 		*ports[i] = conn.LocalAddr().(*net.UDPAddr).Port
 	}
+	s.lastActivity.Store(time.Now().UnixNano())
 	return nil
 }
 
@@ -314,6 +470,7 @@ func (s *Stream) relay(
 		}
 
 		srcStore.Store(src)
+		s.lastActivity.Store(time.Now().UnixNano())
 
 		var dst *net.UDPAddr
 		if s.symmetric {

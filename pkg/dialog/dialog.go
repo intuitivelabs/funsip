@@ -56,11 +56,12 @@ type Manager struct {
 	dialogs map[string]*Dialog
 	mu      sync.RWMutex
 
-	sender    Sender
-	metrics   *metrics.Metrics
-	pcapDir   string
-	localIP   string
-	localPort int
+	sender       Sender
+	metrics      *metrics.Metrics
+	pcapDir      string
+	localIP      string
+	localPort    int
+	mediaCleanup func(callID string)
 
 	dlgGate atomic.Bool
 }
@@ -74,6 +75,14 @@ func NewManager(sender Sender, m *metrics.Metrics, localIP string, localPort int
 		localPort: localPort,
 		pcapDir:   pcapDir,
 	}
+}
+
+// SetMediaCleanup registers a callback invoked when a dialog ends
+// via a path that does not naturally tear media down (currently: the
+// timeout-driven B2BUA BYE). On a regular BYE the request handler
+// already calls Proxy.CleanupMediaForCallID directly.
+func (m *Manager) SetMediaCleanup(fn func(callID string)) {
+	m.mediaCleanup = fn
 }
 
 func (m *Manager) DialogCount() int {
@@ -345,6 +354,10 @@ func (m *Manager) fireTimeout(d *Dialog) {
 		baseCSeq := int(d.cseq.Add(1)) + 1_000_000
 		m.sendBYE(d.CallID, caller, callee, baseCSeq)
 		m.sendBYE(d.CallID, callee, caller, baseCSeq+1)
+	}
+
+	if m.mediaCleanup != nil {
+		m.mediaCleanup(d.CallID)
 	}
 
 	if d.pcap != nil {

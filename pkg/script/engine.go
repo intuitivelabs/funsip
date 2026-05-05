@@ -362,6 +362,16 @@ func (e *Engine) registerFunctions(vm *goja.Runtime, req *sip.Message) {
 				if v, ok := m["symmetric"].(bool); ok {
 					opts.Symmetric = v
 				}
+				switch v := m["idleTimeout"].(type) {
+				case int64:
+					opts.IdleTimeout = time.Duration(v) * time.Second
+				case float64:
+					opts.IdleTimeout = time.Duration(v) * time.Second
+				case string:
+					if d, err := time.ParseDuration(v); err == nil {
+						opts.IdleTimeout = d
+					}
+				}
 			}
 		}
 		if err := e.proxy.AnchorMedia(req, opts); err != nil {

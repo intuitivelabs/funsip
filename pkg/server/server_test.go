@@ -1290,6 +1290,213 @@ function onRequest(req) {
 // importing the package directly via a long path.
 func sdpParse(s string) (*sdp.SDP, error) { return sdp.Parse([]byte(s)) }
 
+// ---------- Media port lifecycle tests ----------
+
+func TestBYEReleasesMediaPorts(t *testing.T) {
+	h := setupHarness(t)
+
+	// Build a session directly so the test does not depend on full
+	// signaling round-trips.
+	offer := "v=0\r\no=a 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 30000 RTP/AVP 0\r\n"
+	answer := "v=0\r\no=b 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\n"
+	po, _ := sdp.Parse([]byte(offer))
+	pa, _ := sdp.Parse([]byte(answer))
+
+	sess := h.srv.Media.GetOrCreate("bye-release-1", media.Options{Symmetric: true, IdleTimeout: time.Hour})
+	if err := sess.AnchorOffer(po); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.AnchorAnswer(pa); err != nil {
+		t.Fatal(err)
+	}
+	stream := sess.Streams[0]
+	if stream.Closed() {
+		t.Fatal("stream closed too early")
+	}
+
+	// Simulate the BYE-driven cleanup the request handler would run.
+	h.srv.Proxy.CleanupMediaForCallID("bye-release-1")
+
+	if !stream.Closed() {
+		t.Errorf("stream should be Closed() after BYE cleanup")
+	}
+}
+
+func TestRTPIdleReleasesMediaPorts(t *testing.T) {
+	h := setupHarness(t)
+
+	offer := "v=0\r\no=a 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 30000 RTP/AVP 0\r\na=sendrecv\r\n"
+	answer := "v=0\r\no=b 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=sendrecv\r\n"
+	po, _ := sdp.Parse([]byte(offer))
+	pa, _ := sdp.Parse([]byte(answer))
+
+	sess := h.srv.Media.GetOrCreate("idle-release-1", media.Options{
+		Symmetric:   true,
+		IdleTimeout: 100 * time.Millisecond,
+	})
+	if err := sess.AnchorOffer(po); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.AnchorAnswer(pa); err != nil {
+		t.Fatal(err)
+	}
+	stream := sess.Streams[0]
+	if stream.IsOnHold() {
+		t.Fatal("expected stream not to be on hold for sendrecv SDP")
+	}
+
+	// Wait past the idle threshold, then trigger a synchronous sweep.
+	time.Sleep(200 * time.Millisecond)
+	h.srv.Media.SweepNow()
+
+	if !stream.Closed() {
+		t.Errorf("idle stream should have been released by sweeper")
+	}
+}
+
+func TestRTPIdleNotReleasedWhenOnHold(t *testing.T) {
+	h := setupHarness(t)
+
+	tests := []struct {
+		name   string
+		offer  string
+		answer string
+	}{
+		{
+			name:   "a=sendonly in offer",
+			offer:  "v=0\r\no=a 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 30000 RTP/AVP 0\r\na=sendonly\r\n",
+			answer: "v=0\r\no=b 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\n",
+		},
+		{
+			name:   "a=inactive in answer",
+			offer:  "v=0\r\no=a 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 30000 RTP/AVP 0\r\n",
+			answer: "v=0\r\no=b 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=inactive\r\n",
+		},
+		{
+			name:   "c=0.0.0.0 (deprecated hold marker)",
+			offer:  "v=0\r\no=a 1 1 IN IP4 0.0.0.0\r\ns=-\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\nm=audio 30000 RTP/AVP 0\r\n",
+			answer: "v=0\r\no=b 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			po, _ := sdp.Parse([]byte(tc.offer))
+			pa, _ := sdp.Parse([]byte(tc.answer))
+
+			callID := "hold-" + tc.name
+			sess := h.srv.Media.GetOrCreate(callID, media.Options{
+				Symmetric:   true,
+				IdleTimeout: 200 * time.Millisecond,
+			})
+			if err := sess.AnchorOffer(po); err != nil {
+				t.Fatal(err)
+			}
+			if err := sess.AnchorAnswer(pa); err != nil {
+				t.Fatal(err)
+			}
+			stream := sess.Streams[0]
+
+			if !stream.IsOnHold() {
+				t.Fatalf("expected stream to be on hold for %q", tc.name)
+			}
+
+			// Wait past the idle threshold and force a sweep.
+			time.Sleep(300 * time.Millisecond)
+			h.srv.Media.SweepNow()
+
+			if stream.Closed() {
+				t.Errorf("on-hold stream must not be released by idle sweeper")
+			}
+
+			// Cleanup so the next subtest starts fresh.
+			h.srv.Proxy.CleanupMediaForCallID(callID)
+		})
+	}
+}
+
+func TestDialogTimeoutReleasesMediaPorts(t *testing.T) {
+	h := setupHarness(t)
+
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkPort := sinkConn.LocalAddr().(*net.UDPAddr).Port
+
+	if err := h.srv.DB.SaveBinding(&store.Binding{
+		AOR:          "sip:bob@test.local",
+		Contact:      fmt.Sprintf("sip:bob@127.0.0.1:%d", sinkPort),
+		ReceivedIP:   "127.0.0.1",
+		ReceivedPort: sinkPort,
+		Transport:    "UDP",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Anchor media programmatically before sending the INVITE so we
+	// can hold a reference to the stream and observe its closure when
+	// the dialog times out.
+	callID := "dlg-mt-1"
+	sess := h.srv.Media.GetOrCreate(callID, media.Options{
+		Symmetric:   true,
+		IdleTimeout: time.Hour, // disable idle release
+	})
+	po, _ := sdp.Parse([]byte("v=0\r\no=a 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 30000 RTP/AVP 0\r\n"))
+	pa, _ := sdp.Parse([]byte("v=0\r\no=b 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\n"))
+	if err := sess.AnchorOffer(po); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.AnchorAnswer(pa); err != nil {
+		t.Fatal(err)
+	}
+	stream := sess.Streams[0]
+
+	// Now drive the SIP side to create a dialog with a 1 s timeout.
+	script := `
+function onRequest(req) {
+    if (req.method === "INVITE") {
+        setupDialog({timeout: 1});
+        var contacts = lookup();
+        if (contacts.length > 0) proxy(contacts[0]);
+        else sendResponse(404);
+        return;
+    }
+    sendResponse(405);
+}`
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy failed: %v", r)
+	}
+
+	branch := "z9hG4bK-mt"
+	fromTag := "alice-mt"
+	invite := buildRequestExplicit("INVITE", "sip:bob@test.local", h.clientAddr.Port,
+		"alice", "bob", callID, 1, branch, fromTag,
+		[]string{fmt.Sprintf("Contact: <sip:alice@127.0.0.1:%d>", h.clientAddr.Port)}, "")
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(invite), target); err != nil {
+		t.Fatal(err)
+	}
+	// Drain forwarded INVITE on sink.
+	sinkConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 65535)
+	if _, _, err := sinkConn.ReadFromUDP(buf); err != nil {
+		t.Fatalf("sink did not receive forwarded INVITE: %v", err)
+	}
+
+	// Wait for dialog timeout to fire and trigger media cleanup.
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && !stream.Closed() {
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if !stream.Closed() {
+		t.Errorf("stream should be closed after dialog timeout fires")
+	}
+}
+
 // ---------- Dialog tests ----------
 
 func TestSetupDialogAndBYECleanup(t *testing.T) {

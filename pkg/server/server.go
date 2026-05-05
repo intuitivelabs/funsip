@@ -56,6 +56,7 @@ func New(cfg *config.Config) (*Server, error) {
 	s.Dialogs = dialog.NewManager(s.Transport, s.Metrics, cfg.ListenIP, cfg.ListenPort, cfg.PCAPDir)
 
 	s.Proxy.SetDialogConfirm(s.Dialogs.ConfirmFromResponse)
+	s.Dialogs.SetMediaCleanup(s.Proxy.CleanupMediaForCallID)
 	s.Transport.SetCaptureHook(s.Dialogs.CapturePacket)
 
 	eng, err := script.NewEngine(cfg.ScriptPath, s.Proxy, s.Registrar, s.Auth, db)
