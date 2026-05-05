@@ -317,6 +317,51 @@ func (e *Engine) registerFunctions(vm *goja.Runtime, req *sip.Message) {
 		return goja.Undefined()
 	})
 
+	vm.Set("setRequestUri", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			return goja.Undefined()
+		}
+		exported := call.Argument(0).Export()
+
+		switch v := exported.(type) {
+		case string:
+			uri, err := sip.ParseURI(v)
+			if err != nil {
+				log.Printf("[script] setRequestUri: %v", err)
+				return goja.Undefined()
+			}
+			req.RequestURI = uri
+		case map[string]interface{}:
+			base := req.RequestURI
+			if base == nil {
+				base = &sip.URI{Scheme: "sip", Params: map[string]string{}}
+			} else {
+				base = base.Clone()
+			}
+			if s, ok := v["scheme"].(string); ok && s != "" {
+				base.Scheme = s
+			}
+			if s, ok := v["user"].(string); ok {
+				base.User = s
+			}
+			if s, ok := v["host"].(string); ok && s != "" {
+				base.Host = s
+			}
+			if p, ok := v["port"]; ok {
+				switch pv := p.(type) {
+				case int64:
+					base.Port = int(pv)
+				case float64:
+					base.Port = int(pv)
+				}
+			}
+			req.RequestURI = base
+		default:
+			log.Printf("[script] setRequestUri: unsupported argument type %T", exported)
+		}
+		return goja.Undefined()
+	})
+
 	vm.Set("lookup", func(call goja.FunctionCall) goja.Value {
 		var uri *sip.URI
 		if len(call.Arguments) > 0 {
@@ -359,7 +404,9 @@ func (e *Engine) registerFunctions(vm *goja.Runtime, req *sip.Message) {
 
 	vm.Set("proxy", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) == 0 {
-			log.Printf("[script] proxy() requires at least one argument")
+			if err := e.proxy.ForwardToRequestURI(req); err != nil {
+				log.Printf("[script] proxy() error: %v", err)
+			}
 			return goja.Undefined()
 		}
 

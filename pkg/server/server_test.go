@@ -813,6 +813,182 @@ func firstLine(s string) string {
 	return s
 }
 
+func TestProxyNoArgsForwardsToRequestURI(t *testing.T) {
+	h := setupHarness(t)
+
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkPort := sinkConn.LocalAddr().(*net.UDPAddr).Port
+
+	script := `
+function onRequest(req) {
+    if (req.method === "MESSAGE") {
+        proxy();  // no args: forward to host:port in Request-URI
+        return;
+    }
+    sendResponse(405, "Method Not Allowed");
+}
+`
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy failed: %v", r)
+	}
+
+	ruri := fmt.Sprintf("sip:user@127.0.0.1:%d", sinkPort)
+	msg := buildRequest("MESSAGE", ruri, h.clientAddr.Port,
+		"sender", "user", "argless-proxy-1", 1,
+		[]string{"Content-Type: text/plain"}, "hi")
+
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(msg), target); err != nil {
+		t.Fatal(err)
+	}
+
+	sinkConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 65535)
+	n, _, err := sinkConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("sink did not receive forwarded MESSAGE: %v", err)
+	}
+	fwd := string(buf[:n])
+
+	first := firstLine(fwd)
+	if !strings.Contains(first, "MESSAGE ") {
+		t.Errorf("expected MESSAGE request line, got: %q", first)
+	}
+	// proxy() with no args must keep the original Request-URI verbatim.
+	if !strings.Contains(first, ruri) {
+		t.Errorf("Request-URI not preserved: line=%q want substring=%q", first, ruri)
+	}
+}
+
+func TestMaxForwardsAddedIfMissing(t *testing.T) {
+	h := setupHarness(t)
+
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkPort := sinkConn.LocalAddr().(*net.UDPAddr).Port
+
+	script := `function onRequest(req) { proxy(); }`
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy failed: %v", r)
+	}
+
+	// Build a request WITHOUT a Max-Forwards header.
+	ruri := fmt.Sprintf("sip:x@127.0.0.1:%d", sinkPort)
+	branch := fmt.Sprintf("z9hG4bK%d-mf-missing", time.Now().UnixNano())
+	msg := fmt.Sprintf(
+		"MESSAGE %s SIP/2.0\r\n"+
+			"Via: SIP/2.0/UDP 127.0.0.1:%d;branch=%s;rport\r\n"+
+			"From: <sip:s@test.local>;tag=mft\r\n"+
+			"To: <sip:x@test.local>\r\n"+
+			"Call-ID: mf-missing-1\r\n"+
+			"CSeq: 1 MESSAGE\r\n"+
+			"Content-Length: 0\r\n\r\n",
+		ruri, h.clientAddr.Port, branch,
+	)
+
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(msg), target); err != nil {
+		t.Fatal(err)
+	}
+
+	sinkConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 65535)
+	n, _, err := sinkConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("sink did not receive forwarded MESSAGE: %v", err)
+	}
+	fwd := string(buf[:n])
+
+	mf := extractHeader(fwd, "Max-Forwards")
+	// Stack inserts 70 on receipt; proxy decrements to 69 before forward.
+	if mf != "69" {
+		t.Errorf("Max-Forwards: expected 69 (70 default - 1 hop), got %q\n%s", mf, fwd)
+	}
+}
+
+func TestMaxForwardsZeroRejectsForward(t *testing.T) {
+	h := setupHarness(t)
+
+	script := `function onRequest(req) { proxyTo("127.0.0.1:9", "UDP"); }`
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy failed: %v", r)
+	}
+
+	branch := fmt.Sprintf("z9hG4bK%d-mf-zero", time.Now().UnixNano())
+	msg := fmt.Sprintf(
+		"MESSAGE sip:x@test.local SIP/2.0\r\n"+
+			"Via: SIP/2.0/UDP 127.0.0.1:%d;branch=%s;rport\r\n"+
+			"Max-Forwards: 0\r\n"+
+			"From: <sip:s@test.local>;tag=mfz\r\n"+
+			"To: <sip:x@test.local>\r\n"+
+			"Call-ID: mf-zero-1\r\n"+
+			"CSeq: 1 MESSAGE\r\n"+
+			"Content-Length: 0\r\n\r\n",
+		h.clientAddr.Port, branch,
+	)
+
+	resp := h.sendSIP(msg)
+	code, _ := parseStatusLine(resp)
+	if code != 483 {
+		t.Errorf("MF=0 should produce 483 Too Many Hops, got %d\n%s", code, resp)
+	}
+}
+
+func TestSetRequestUri(t *testing.T) {
+	h := setupHarness(t)
+
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkPort := sinkConn.LocalAddr().(*net.UDPAddr).Port
+
+	script := fmt.Sprintf(`
+function onRequest(req) {
+    if (req.method === "MESSAGE") {
+        setRequestUri("sip:rewritten@127.0.0.1:%d");
+        proxy();
+        return;
+    }
+    sendResponse(405, "Method Not Allowed");
+}
+`, sinkPort)
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy failed: %v", r)
+	}
+
+	// Original Request-URI points elsewhere; the script rewrites it.
+	msg := buildRequest("MESSAGE", "sip:original@some.where:9999", h.clientAddr.Port,
+		"s", "x", "rewrite-1", 1, []string{"Content-Type: text/plain"}, "hi")
+
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(msg), target); err != nil {
+		t.Fatal(err)
+	}
+
+	sinkConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 65535)
+	n, _, err := sinkConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("sink did not receive forwarded MESSAGE: %v", err)
+	}
+	fwd := string(buf[:n])
+
+	first := firstLine(fwd)
+	wantRURI := fmt.Sprintf("sip:rewritten@127.0.0.1:%d", sinkPort)
+	if !strings.Contains(first, wantRURI) {
+		t.Errorf("setRequestUri did not take effect:\n got: %q\nwant substring: %q", first, wantRURI)
+	}
+}
+
 func TestTransactionRetransmissionAbsorbed(t *testing.T) {
 	h := setupHarness(t)
 

@@ -139,6 +139,64 @@ func (p *Proxy) ForwardToBinding(req *sip.Message, binding *store.Binding) error
 	return err
 }
 
+// ForwardToRequestURI forwards req to the host:port encoded in its
+// Request-URI without rewriting the URI itself. This is the "send to where
+// the request says to go" mode used by proxy() with no arguments.
+func (p *Proxy) ForwardToRequestURI(req *sip.Message) error {
+	if req.RequestURI == nil {
+		return fmt.Errorf("forward: no Request-URI")
+	}
+	if p.metrics != nil {
+		p.metrics.RecordForwarded()
+	}
+
+	fwd := req.Clone()
+
+	mf := fwd.MaxForwards()
+	if mf <= 0 {
+		resp := sip.CreateResponseFromRequest(req, 483, "Too Many Hops")
+		p.txLayer.RespondToRequest(req, resp)
+		return nil
+	}
+	fwd.Headers.Set("Max-Forwards", strconv.Itoa(mf-1))
+
+	transport := strings.ToUpper(req.RequestURI.Params["transport"])
+	if transport == "" {
+		transport = "UDP"
+	}
+
+	branch := transaction.GenerateBranch()
+	via := &sip.Via{
+		Transport: transport,
+		Host:      p.localIP,
+		Port:      p.localPort,
+		Params: map[string]string{
+			"branch": branch,
+			"rport":  "",
+		},
+	}
+	fwd.Headers.Prepend("Via", via.String())
+
+	rr := fmt.Sprintf("<sip:%s:%d;lr>", p.localIP, p.localPort)
+	fwd.Headers.Prepend("Record-Route", rr)
+
+	p.removeProxyAuth(fwd)
+
+	port := req.RequestURI.Port
+	if port == 0 {
+		port = 5060
+	}
+	dst := fmt.Sprintf("%s:%d", req.RequestURI.Host, port)
+
+	dstHost, dstPort := resolveDestination(dst, transport)
+	fullDst := fmt.Sprintf("%s:%d", dstHost, dstPort)
+
+	_, err := p.txLayer.NewClientTxFor(req, fwd, fullDst, transport, func(resp *sip.Message) {
+		p.forwardResponse(req, resp)
+	})
+	return err
+}
+
 func (p *Proxy) ForwardInDialog(req *sip.Message) error {
 	if p.metrics != nil {
 		p.metrics.RecordForwarded()

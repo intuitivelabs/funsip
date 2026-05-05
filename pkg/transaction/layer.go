@@ -63,6 +63,13 @@ func (l *Layer) receiveRequest(req *sip.Message) {
 		l.metrics.RecordReceived()
 	}
 
+	// RFC3261 §16: a proxy that receives a request without a Max-Forwards
+	// header field SHOULD insert one with a value of 70. The forward path
+	// later refuses to decrement past zero, which terminates loops.
+	if req.MaxForwards() < 0 {
+		req.Headers.Set("Max-Forwards", "70")
+	}
+
 	if req.Method == "CANCEL" {
 		inviteKey := MakeInviteKeyFromCancel(req).String()
 		l.mu.RLock()

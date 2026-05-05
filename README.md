@@ -85,8 +85,10 @@ The routing script is JavaScript executed for each out-of-dialog or dialog-initi
 | `sendResponse(code, reason, headers)` | Same as above, plus extra response headers. `headers` is an object `{"X-Foo": "bar", "X-List": ["a", "b"]}` or an array of `"Name: value"` strings. |
 | `appendHeader(name, value)` | Append a header to the current request (also propagates into anything proxied afterwards). Multiple calls add multiple values. |
 | `removeHeader(name)` | Remove all instances of a header by name. Compact forms (e.g. `"v"` for `Via`, `"f"` for `From`) are accepted. |
+| `setRequestUri(uri)` | Rewrite the Request-URI. Argument is a URI string (`"sip:user@host:port"`) or a partial-update object (`{user: "...", host: "...", port: 5060}`). |
 | `lookup()` | Look up registered contacts for the Request-URI. Returns array of binding objects. |
 | `lookup(uriString)` | Look up registered contacts for a specific URI. |
+| `proxy()` | Forward to the host:port encoded in the current Request-URI. The Request-URI itself is preserved verbatim. |
 | `proxy(binding)` | Forward request to a registered contact (uses received IP:port). |
 | `proxyTo(destination, transport)` | Forward request to a fixed destination (e.g. `"10.0.0.1:5060"`). |
 | `log(...)` | Write to the server log. |
@@ -99,6 +101,7 @@ The transaction layer handles these automatically — your routing script will n
 - **100 Trying** is generated for each INVITE server transaction.
 - **CANCEL matching a pending INVITE** (RFC3261 §9.2): a 200 OK is sent for the CANCEL; CANCEL is forwarded on every INVITE branch still in `Calling` or `Proceeding` (i.e. that has not received a final response); a 487 Request Terminated is sent for the INVITE if no final response has been forwarded yet. Only orphan CANCELs (no matching INVITE) reach the routing script.
 - **Retransmissions** of any kind are absorbed by the matching transaction.
+- **Max-Forwards loop guard**: if a received request has no `Max-Forwards` header, the stack inserts `Max-Forwards: 70`. On forward, the value is decremented by one; if it would go below zero, the forward is refused with `483 Too Many Hops`.
 
 ### Request object properties
 
