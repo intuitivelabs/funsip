@@ -225,6 +225,7 @@ func renderStats(data map[string]interface{}) string {
 	tx, _ := data["transactions"].(map[string]interface{})
 	tp, _ := data["transport"].(map[string]interface{})
 	pr, _ := data["processing"].(map[string]interface{})
+	dl, _ := data["dialogs"].(map[string]interface{})
 
 	fmt.Fprintf(&b, "[white::b]── General ────────────────────────────────────────────[-:-:-]\n")
 	fmt.Fprintf(&b, "  [yellow]Version[white]      %v\n", data["version"])
@@ -255,6 +256,16 @@ func renderStats(data map[string]interface{}) string {
 		fmt.Fprintf(&b, "\n  [yellow]Request rate[white]\n")
 		fmt.Fprintf(&b, "    last 5 min   %.2f req/s\n", getFloat(pr, "request_rate_5m_per_sec"))
 		fmt.Fprintf(&b, "    last 1 hour  %.2f req/s\n", getFloat(pr, "request_rate_1h_per_sec"))
+	}
+
+	fmt.Fprintf(&b, "\n[white::b]── Dialogs ────────────────────────────────────────────[-:-:-]\n")
+	if dl != nil {
+		fmt.Fprintf(&b, "  [yellow]Active[white]              %v\n", dl["active"])
+		fmt.Fprintf(&b, "  [yellow]Created[white]             %v\n", dl["created"])
+		fmt.Fprintf(&b, "  [yellow]Completed[white]           %v\n", dl["completed"])
+		fmt.Fprintf(&b, "  [yellow]Timed-out (B2BUA BYE)[white]  %v\n", dl["timed_out"])
+	} else {
+		fmt.Fprintf(&b, "  (no dialog statistics)\n")
 	}
 
 	fmt.Fprintf(&b, "\n[white::b]── Transactions ───────────────────────────────────────[-:-:-]\n")

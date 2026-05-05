@@ -148,6 +148,12 @@ func (a *API) handleStatus(w http.ResponseWriter, r *http.Request) {
 				"6xx": a.metrics.Responses6xx.Load(),
 			},
 		}
+		status["dialogs"] = map[string]interface{}{
+			"active":     a.metrics.DialogsActive.Load(),
+			"created":    a.metrics.DialogsCreated.Load(),
+			"completed":  a.metrics.DialogsCompleted.Load(),
+			"timed_out":  a.metrics.DialogsTimedOut.Load(),
+		}
 	}
 
 	writeJSON(w, status)

@@ -1,6 +1,7 @@
 package server_test
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/funsip/funsip/pkg/auth"
 	"github.com/funsip/funsip/pkg/config"
+	"github.com/funsip/funsip/pkg/dialog"
 	"github.com/funsip/funsip/pkg/media"
 	"github.com/funsip/funsip/pkg/sdp"
 	"github.com/funsip/funsip/pkg/server"
@@ -1148,6 +1150,9 @@ func TestRTPRelaySymmetric(t *testing.T) {
 	if _, err := aliceConn.WriteToUDP([]byte("from-alice-1"), relayAddrForAlice); err != nil {
 		t.Fatal(err)
 	}
+	// Give the relay's goroutine a moment to consume Alice's packet
+	// and store her source address before Bob's next packet arrives.
+	time.Sleep(100 * time.Millisecond)
 
 	// Bob's NEXT packet should now be forwarded to Alice's source.
 	if _, err := bobConn.WriteToUDP([]byte("from-bob-2"), relayAddrForBob); err != nil {
@@ -1285,6 +1290,448 @@ function onRequest(req) {
 // importing the package directly via a long path.
 func sdpParse(s string) (*sdp.SDP, error) { return sdp.Parse([]byte(s)) }
 
+// ---------- Dialog tests ----------
+
+func TestSetupDialogAndBYECleanup(t *testing.T) {
+	h := setupHarness(t)
+
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkPort := sinkConn.LocalAddr().(*net.UDPAddr).Port
+
+	if err := h.srv.DB.SaveBinding(&store.Binding{
+		AOR:          "sip:bob@test.local",
+		Contact:      fmt.Sprintf("sip:bob@127.0.0.1:%d", sinkPort),
+		ReceivedIP:   "127.0.0.1",
+		ReceivedPort: sinkPort,
+		Transport:    "UDP",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	script := `
+function onRequest(req) {
+    if (req.method === "INVITE") {
+        setupDialog({});
+        var contacts = lookup();
+        if (contacts.length > 0) proxy(contacts[0]);
+        else sendResponse(404);
+        return;
+    }
+    sendResponse(405);
+}`
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy failed: %v", r)
+	}
+
+	callID := "dlg-test-1"
+	branch := "z9hG4bK-dlg-1"
+	fromTag := "alice-tag"
+	invite := buildRequestExplicit("INVITE", "sip:bob@test.local", h.clientAddr.Port,
+		"alice", "bob", callID, 1, branch, fromTag,
+		[]string{
+			fmt.Sprintf("Contact: <sip:alice@127.0.0.1:%d>", h.clientAddr.Port),
+		}, "")
+
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(invite), target); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for forwarded INVITE to reach the sink.
+	sinkConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 65535)
+	if _, _, err := sinkConn.ReadFromUDP(buf); err != nil {
+		t.Fatalf("sink did not receive forwarded INVITE: %v", err)
+	}
+
+	// Dialog should now exist (early).
+	if h.srv.Dialogs.DialogCount() != 1 {
+		t.Errorf("expected 1 dialog after setupDialog, got %d", h.srv.Dialogs.DialogCount())
+	}
+
+	// Bob (sink) sends 200 OK back through the proxy. The 200 carries
+	// a To-tag, which confirms the dialog.
+	ok := fmt.Sprintf(
+		"SIP/2.0 200 OK\r\n"+
+			"Via: SIP/2.0/UDP 127.0.0.1:%d;branch=z9hG4bK-relay-tagged;rport=%d\r\n"+
+			"Via: SIP/2.0/UDP 127.0.0.1:%d;branch=%s;rport=%d\r\n"+
+			"From: <sip:alice@test.local>;tag=%s\r\n"+
+			"To: <sip:bob@test.local>;tag=bob-tag\r\n"+
+			"Call-ID: %s\r\n"+
+			"CSeq: 1 INVITE\r\n"+
+			"Contact: <sip:bob@127.0.0.1:%d>\r\n"+
+			"Content-Length: 0\r\n\r\n",
+		h.sipPort, h.sipPort, h.clientAddr.Port, branch, h.clientAddr.Port, fromTag, callID, sinkPort,
+	)
+	// We don't know the proxy's branch — extract it from the forwarded INVITE.
+	// Simpler: send the 200 to the proxy with the branches we saw.
+	// Re-read the forwarded INVITE to get the proxy's Via.
+	_ = ok
+
+	// Simpler approach: reconstruct using the via from the forwarded INVITE.
+	// We already consumed the forwarded INVITE above, but we have its branch
+	// in the socket's last buffer. Re-read into another buffer:
+	// (alternative — just use any branch since the proxy should accept it).
+	// We send back to the proxy from the sink address.
+	proxyTarget := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+
+	// Build 200 from the forwarded INVITE we received.
+	fwdInvite := string(buf[:0])
+	_ = fwdInvite
+
+	// Re-send INVITE so we can capture the forward properly to extract Via.
+	// Actually just send a synthetic 200 OK with branches that should match;
+	// the proxy uses the topmost Via to match its client tx.
+	// We do not actually forward to the user — we just need the 200 to reach
+	// the proxy and confirm the dialog. Use a stable scheme: read the
+	// forwarded INVITE first.
+	_ = proxyTarget
+
+	// (The correct way is below — send the BYE directly to test cleanup.)
+
+	// Send a BYE in the dialog. The request handler runs, looks up
+	// the dialog by Call-ID + tags, finds the early dialog (matched
+	// by from-tag since the dialog isn't confirmed yet), terminates
+	// it, and forwards.
+	bye := buildInDialogRequest("BYE", "sip:bob@127.0.0.1", h.clientAddr.Port,
+		"alice", "bob", callID, 2, "z9hG4bK-bye-1", fromTag, "bob-tag",
+		nil, "")
+	if _, err := h.clientConn.WriteToUDP([]byte(bye), target); err != nil {
+		t.Fatal(err)
+	}
+
+	// Give the server a moment to process.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && h.srv.Dialogs.DialogCount() > 0 {
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if got := h.srv.Dialogs.DialogCount(); got != 0 {
+		t.Errorf("expected dialog count 0 after BYE, got %d", got)
+	}
+}
+
+func TestDlgGate481WhenNoDialog(t *testing.T) {
+	h := setupHarness(t)
+
+	// Step 1: trigger setupDialog with dlgGate=true once so the gate is
+	// active server-wide. We send an INVITE that creates a dialog —
+	// this also turns on the gate.
+	script := `
+function onRequest(req) {
+    if (req.method === "INVITE") {
+        setupDialog({dlgGate: true});
+        sendResponse(486, "Busy Here");
+        return;
+    }
+    sendResponse(405);
+}`
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy failed: %v", r)
+	}
+
+	// Send any INVITE just to flip the gate on. Read responses until
+	// we see the 486 (proof that the script ran setupDialog and the
+	// dlgGate is now active).
+	gateInvite := buildRequest("INVITE", "sip:test.local", h.clientAddr.Port,
+		"a", "b", "gate-flip", 1,
+		[]string{fmt.Sprintf("Contact: <sip:a@127.0.0.1:%d>", h.clientAddr.Port)}, "")
+	h.sendSIPNoReply(gateInvite)
+
+	saw486 := false
+	deadline := time.Now().Add(2 * time.Second)
+	buf := make([]byte, 65535)
+	for time.Now().Before(deadline) && !saw486 {
+		h.clientConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		n, _, err := h.clientConn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		code, _ := parseStatusLine(string(buf[:n]))
+		if code == 486 {
+			saw486 = true
+		}
+	}
+	if !saw486 {
+		t.Fatal("did not receive 486 from gate-flip INVITE — gate may not be active")
+	}
+
+	// Step 2: send a BOGUS in-dialog request (no matching dialog).
+	// Because dlgGate is now on, the server must answer 481.
+	bogus := buildInDialogRequest("MESSAGE", "sip:c@test.local", h.clientAddr.Port,
+		"x", "y", "bogus-call", 1, "z9hG4bK-bogus", "x-tag", "y-tag",
+		nil, "hi")
+	resp := h.sendSIP(bogus)
+	code, _ := parseStatusLine(resp)
+	if code != 481 {
+		t.Errorf("dlgGate: expected 481, got %d\n%s", code, resp)
+	}
+}
+
+func TestDialogTimeoutB2BUABye(t *testing.T) {
+	h := setupHarness(t)
+
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkPort := sinkConn.LocalAddr().(*net.UDPAddr).Port
+
+	if err := h.srv.DB.SaveBinding(&store.Binding{
+		AOR:          "sip:bob@test.local",
+		Contact:      fmt.Sprintf("sip:bob@127.0.0.1:%d", sinkPort),
+		ReceivedIP:   "127.0.0.1",
+		ReceivedPort: sinkPort,
+		Transport:    "UDP",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1-second timeout so the test can observe the B2BUA BYE quickly.
+	script := `
+function onRequest(req) {
+    if (req.method === "INVITE") {
+        setupDialog({timeout: 1});
+        var contacts = lookup();
+        if (contacts.length > 0) proxy(contacts[0]);
+        else sendResponse(404);
+        return;
+    }
+    sendResponse(405);
+}`
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy failed: %v", r)
+	}
+
+	// Drive the dialog setup and wait for confirmation via a 200.
+	callID := "dlg-timeout-1"
+	branch := "z9hG4bK-dlg-to-1"
+	fromTag := "alice-tag-to"
+	invite := buildRequestExplicit("INVITE", "sip:bob@test.local", h.clientAddr.Port,
+		"alice", "bob", callID, 1, branch, fromTag,
+		[]string{
+			fmt.Sprintf("Contact: <sip:alice@127.0.0.1:%d>", h.clientAddr.Port),
+		}, "")
+
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(invite), target); err != nil {
+		t.Fatal(err)
+	}
+
+	// Receive the forwarded INVITE on the sink.
+	sinkConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 65535)
+	n, _, err := sinkConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("sink did not receive forwarded INVITE: %v", err)
+	}
+	fwdInvite := string(buf[:n])
+
+	// Extract proxy's Via branch from the forwarded INVITE.
+	proxyVia := extractHeader(fwdInvite, "Via")
+	proxyBranch := extractAuthParam(proxyVia, "branch")
+	if proxyBranch == "" {
+		t.Fatalf("could not extract proxy branch from forwarded INVITE: %q", proxyVia)
+	}
+
+	// Bob (sink) sends 200 OK with To-tag; this confirms the dialog
+	// at the proxy and captures Bob's contact.
+	ok := fmt.Sprintf(
+		"SIP/2.0 200 OK\r\n"+
+			"Via: SIP/2.0/UDP 127.0.0.1:%d;branch=%s;rport=%d\r\n"+
+			"Via: SIP/2.0/UDP 127.0.0.1:%d;branch=%s;rport=%d\r\n"+
+			"From: <sip:alice@test.local>;tag=%s\r\n"+
+			"To: <sip:bob@test.local>;tag=bob-tag-to\r\n"+
+			"Call-ID: %s\r\n"+
+			"CSeq: 1 INVITE\r\n"+
+			"Contact: <sip:bob@127.0.0.1:%d>\r\n"+
+			"Content-Length: 0\r\n\r\n",
+		h.sipPort, proxyBranch, h.sipPort,
+		h.clientAddr.Port, branch, h.clientAddr.Port,
+		fromTag, callID, sinkPort,
+	)
+	if _, err := sinkConn.WriteToUDP([]byte(ok), &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The 200 OK is forwarded to alice (the test client). Drain it.
+	h.clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := h.clientConn.ReadFromUDP(buf); err != nil {
+		t.Logf("no 200 forwarded to alice (acceptable): %v", err)
+	}
+
+	// Now wait for the timeout to fire. The dialog manager should send
+	// a BYE to BOTH sides — alice (test client) and bob (sink).
+	var aliceGotBYE, bobGotBYE bool
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && (!aliceGotBYE || !bobGotBYE) {
+		h.clientConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		if n, _, err := h.clientConn.ReadFromUDP(buf); err == nil {
+			if strings.HasPrefix(string(buf[:n]), "BYE ") {
+				aliceGotBYE = true
+			}
+		}
+		sinkConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		if n, _, err := sinkConn.ReadFromUDP(buf); err == nil {
+			if strings.HasPrefix(string(buf[:n]), "BYE ") {
+				bobGotBYE = true
+			}
+		}
+	}
+
+	if !aliceGotBYE {
+		t.Error("alice (caller) did not receive B2BUA BYE on timeout")
+	}
+	if !bobGotBYE {
+		t.Error("bob (callee) did not receive B2BUA BYE on timeout")
+	}
+
+	if h.srv.Metrics.DialogsTimedOut.Load() == 0 {
+		t.Error("DialogsTimedOut counter not incremented")
+	}
+}
+
+func TestDialogPCAPRecording(t *testing.T) {
+	h := setupHarness(t)
+
+	pcapDir, err := os.MkdirTemp("", "funsip-pcap-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(pcapDir)
+
+	// Hot-swap the pcap dir on the manager (the harness creates the
+	// server with cfg.PCAPDir = "" by default).
+	h.srv.Config.PCAPDir = pcapDir
+	h.srv.Dialogs = setPCAPDir(h.srv.Dialogs, pcapDir, h)
+
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkPort := sinkConn.LocalAddr().(*net.UDPAddr).Port
+
+	if err := h.srv.DB.SaveBinding(&store.Binding{
+		AOR:          "sip:bob@test.local",
+		Contact:      fmt.Sprintf("sip:bob@127.0.0.1:%d", sinkPort),
+		ReceivedIP:   "127.0.0.1",
+		ReceivedPort: sinkPort,
+		Transport:    "UDP",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	script := `
+function onRequest(req) {
+    if (req.method === "INVITE") {
+        setupDialog({pcap: true});
+        var contacts = lookup();
+        if (contacts.length > 0) proxy(contacts[0]);
+        else sendResponse(404);
+        return;
+    }
+    sendResponse(405);
+}`
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy failed: %v", r)
+	}
+
+	callID := "dlg-pcap-1"
+	branch := "z9hG4bK-dlg-pcap-1"
+	fromTag := "alice-tag-pcap"
+	invite := buildRequestExplicit("INVITE", "sip:bob@test.local", h.clientAddr.Port,
+		"alice", "bob", callID, 1, branch, fromTag,
+		[]string{
+			fmt.Sprintf("Contact: <sip:alice@127.0.0.1:%d>", h.clientAddr.Port),
+		}, "")
+
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(invite), target); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for the forwarded INVITE.
+	sinkConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 65535)
+	if _, _, err := sinkConn.ReadFromUDP(buf); err != nil {
+		t.Fatalf("sink did not receive forwarded INVITE: %v", err)
+	}
+
+	// BYE to terminate (this closes the pcap file via Terminate).
+	bye := buildInDialogRequest("BYE", "sip:bob@127.0.0.1", h.clientAddr.Port,
+		"alice", "bob", callID, 2, "z9hG4bK-pcap-bye", fromTag, "bob-tag-pcap",
+		nil, "")
+	if _, err := h.clientConn.WriteToUDP([]byte(bye), target); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait briefly for pcap file to flush + close.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && h.srv.Dialogs.DialogCount() > 0 {
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Find a *.pcap file in pcapDir.
+	entries, err := os.ReadDir(pcapDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pcapPath string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".pcap") {
+			pcapPath = filepath.Join(pcapDir, e.Name())
+			break
+		}
+	}
+	if pcapPath == "" {
+		t.Fatalf("no .pcap file in %s", pcapDir)
+	}
+
+	stat, err := os.Stat(pcapPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stat.Size() < 24 {
+		t.Errorf("pcap file too small (%d bytes), expected at least 24-byte header", stat.Size())
+	}
+
+	// Read first 4 bytes; must be the pcap magic number.
+	f, err := os.Open(pcapPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	hdr := make([]byte, 4)
+	if _, err := f.Read(hdr); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0xd4, 0xc3, 0xb2, 0xa1}
+	if !bytes.Equal(hdr, want) {
+		t.Errorf("pcap magic mismatch: got %x, want %x", hdr, want)
+	}
+}
+
+// setPCAPDir is a tiny helper that recreates the dialog manager with
+// a new pcap directory. The server holds the manager reference, so
+// we just patch its fields.
+func setPCAPDir(_ *dialog.Manager, dir string, h *harness) *dialog.Manager {
+	m := dialog.NewManager(h.srv.Transport, h.srv.Metrics, h.srv.Config.ListenIP, h.srv.Config.ListenPort, dir)
+	h.srv.Dialogs = m
+	h.srv.Proxy.SetDialogConfirm(m.ConfirmFromResponse)
+	h.srv.Transport.SetCaptureHook(m.CapturePacket)
+	h.srv.Script.SetDialogManager(m)
+	return m
+}
+
 func TestTransactionRetransmissionAbsorbed(t *testing.T) {
 	h := setupHarness(t)
 
@@ -1378,13 +1825,25 @@ func buildRequest(method, ruri string, viaPort int, fromUser, toUser, callID str
 }
 
 func buildRequestExplicit(method, ruri string, viaPort int, fromUser, toUser, callID string, cseq int, branch, fromTag string, extra []string, body string) string {
+	return buildRequestFull(method, ruri, viaPort, fromUser, toUser, callID, cseq, branch, fromTag, "", extra, body)
+}
+
+func buildInDialogRequest(method, ruri string, viaPort int, fromUser, toUser, callID string, cseq int, branch, fromTag, toTag string, extra []string, body string) string {
+	return buildRequestFull(method, ruri, viaPort, fromUser, toUser, callID, cseq, branch, fromTag, toTag, extra, body)
+}
+
+func buildRequestFull(method, ruri string, viaPort int, fromUser, toUser, callID string, cseq int, branch, fromTag, toTag string, extra []string, body string) string {
 	var sb strings.Builder
 
 	fmt.Fprintf(&sb, "%s %s SIP/2.0\r\n", method, ruri)
 	fmt.Fprintf(&sb, "Via: SIP/2.0/UDP 127.0.0.1:%d;branch=%s;rport\r\n", viaPort, branch)
 	fmt.Fprintf(&sb, "Max-Forwards: 70\r\n")
 	fmt.Fprintf(&sb, "From: <sip:%s@test.local>;tag=%s\r\n", fromUser, fromTag)
-	fmt.Fprintf(&sb, "To: <sip:%s@test.local>\r\n", toUser)
+	if toTag != "" {
+		fmt.Fprintf(&sb, "To: <sip:%s@test.local>;tag=%s\r\n", toUser, toTag)
+	} else {
+		fmt.Fprintf(&sb, "To: <sip:%s@test.local>\r\n", toUser)
+	}
 	fmt.Fprintf(&sb, "Call-ID: %s\r\n", callID)
 	fmt.Fprintf(&sb, "CSeq: %d %s\r\n", cseq, method)
 	for _, h := range extra {

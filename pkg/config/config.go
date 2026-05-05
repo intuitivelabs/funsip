@@ -14,6 +14,7 @@ type Config struct {
 	HTTPIP     string `json:"http_ip"`
 	HTTPPort   int    `json:"http_port"`
 	LogLevel   string `json:"log_level"`
+	PCAPDir    string `json:"pcap_dir"`
 }
 
 func DefaultConfig() *Config {
@@ -26,6 +27,7 @@ func DefaultConfig() *Config {
 		HTTPIP:     "127.0.0.1",
 		HTTPPort:   8080,
 		LogLevel:   "info",
+		PCAPDir:    ".",
 	}
 }
 

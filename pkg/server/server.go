@@ -7,6 +7,7 @@ import (
 
 	"github.com/funsip/funsip/pkg/auth"
 	"github.com/funsip/funsip/pkg/config"
+	"github.com/funsip/funsip/pkg/dialog"
 	"github.com/funsip/funsip/pkg/management"
 	"github.com/funsip/funsip/pkg/media"
 	"github.com/funsip/funsip/pkg/metrics"
@@ -31,6 +32,7 @@ type Server struct {
 	Mgmt      *management.API
 	Metrics   *metrics.Metrics
 	Media     *media.Manager
+	Dialogs   *dialog.Manager
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -51,12 +53,17 @@ func New(cfg *config.Config) (*Server, error) {
 	s.Proxy.SetMediaManager(s.Media)
 	s.Registrar = registrar.New(db)
 	s.Auth = auth.NewDigestAuth(db, cfg.Domain)
+	s.Dialogs = dialog.NewManager(s.Transport, s.Metrics, cfg.ListenIP, cfg.ListenPort, cfg.PCAPDir)
+
+	s.Proxy.SetDialogConfirm(s.Dialogs.ConfirmFromResponse)
+	s.Transport.SetCaptureHook(s.Dialogs.CapturePacket)
 
 	eng, err := script.NewEngine(cfg.ScriptPath, s.Proxy, s.Registrar, s.Auth, db)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("load script: %w", err)
 	}
+	eng.SetDialogManager(s.Dialogs)
 	s.Script = eng
 
 	s.TxLayer.SetRequestHandler(func(req *sip.Message) {
@@ -64,13 +71,28 @@ func New(cfg *config.Config) (*Server, error) {
 			return
 		}
 
-		if req.Method == "BYE" {
-			// Tear down any media relay for this dialog. The actual
-			// SIP forwarding happens below via the in-dialog path.
-			s.Proxy.CleanupMediaForCallID(req.CallID())
-		}
+		inDialog := s.Proxy.IsInDialog(req)
 
-		if s.Proxy.IsInDialog(req) && req.Method != "REGISTER" {
+		if inDialog && req.Method != "REGISTER" {
+			d := s.Dialogs.FindFor(req)
+
+			if req.Method == "BYE" {
+				if d != nil {
+					s.Dialogs.Terminate(req.CallID())
+				}
+				s.Proxy.CleanupMediaForCallID(req.CallID())
+				if err := s.Proxy.ForwardInDialog(req); err != nil {
+					log.Printf("[server] BYE forward error: %v", err)
+					s.Proxy.SendResponse(req, 500, "Server Internal Error")
+				}
+				return
+			}
+
+			if s.Dialogs.DlgGateActive() && d == nil {
+				s.Proxy.SendResponse(req, 481, "Call/Transaction Does Not Exist")
+				return
+			}
+
 			if err := s.Proxy.ForwardInDialog(req); err != nil {
 				log.Printf("[server] in-dialog forward error: %v", err)
 				s.Proxy.SendResponse(req, 500, "Server Internal Error")
@@ -116,6 +138,9 @@ func (s *Server) Start() error {
 func (s *Server) Stop() {
 	if s.Mgmt != nil {
 		s.Mgmt.Stop()
+	}
+	if s.Dialogs != nil {
+		s.Dialogs.CloseAll()
 	}
 	if s.Transport != nil {
 		s.Transport.Stop()

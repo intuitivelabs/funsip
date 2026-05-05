@@ -23,6 +23,8 @@ type Proxy struct {
 	domain    string
 	metrics   *metrics.Metrics
 	media     *media.Manager
+
+	confirmDialog func(resp *sip.Message)
 }
 
 func New(txLayer *transaction.Layer, localIP string, localPort int, domain string, m *metrics.Metrics) *Proxy {
@@ -37,6 +39,14 @@ func New(txLayer *transaction.Layer, localIP string, localPort int, domain strin
 
 func (p *Proxy) SetMediaManager(m *media.Manager) { p.media = m }
 func (p *Proxy) MediaManager() *media.Manager     { return p.media }
+
+// SetDialogConfirm registers a callback invoked once per response
+// just before it is forwarded back to the original sender. Used by
+// the dialog manager to confirm an early dialog upon a 2xx with a
+// To-tag.
+func (p *Proxy) SetDialogConfirm(fn func(resp *sip.Message)) {
+	p.confirmDialog = fn
+}
 
 // AnchorMedia parses the SDP body of req, allocates a relay slot per
 // media stream, and rewrites the SDP in place so that the connection
@@ -332,6 +342,10 @@ func (p *Proxy) forwardResponse(origReq *sip.Message, resp *sip.Message) {
 	}
 
 	p.maybeAnchorAnswer(fwd)
+
+	if p.confirmDialog != nil {
+		p.confirmDialog(fwd)
+	}
 
 	p.recordFinalDelay(origReq, fwd.StatusCode)
 	p.txLayer.RespondToRequest(origReq, fwd)

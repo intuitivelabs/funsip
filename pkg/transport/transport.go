@@ -19,10 +19,16 @@ type Packet struct {
 
 type MessageHandler func(msg *sip.Message)
 
+// CaptureHook is called for every SIP message that crosses the
+// transport boundary. direction is "in" or "out"; peerHost/peerPort
+// is the remote peer for that direction.
+type CaptureHook func(direction string, msg *sip.Message, peerHost string, peerPort int, transport string)
+
 type Manager struct {
 	udp       *UDPTransport
 	tcp       *TCPTransport
 	handler   MessageHandler
+	capture   CaptureHook
 	localIP   string
 	localPort int
 	mu        sync.RWMutex
@@ -43,6 +49,10 @@ func NewManager(localIP string, localPort int, handler MessageHandler) *Manager 
 		localPort: localPort,
 		handler:   handler,
 	}
+}
+
+func (m *Manager) SetCaptureHook(h CaptureHook) {
+	m.capture = h
 }
 
 func (m *Manager) Start() error {
@@ -91,6 +101,10 @@ func (m *Manager) onPacket(pkt Packet) {
 		applyReceivedRport(msg)
 	}
 
+	if m.capture != nil {
+		m.capture("in", msg, msg.SourceIP, msg.SourcePort, msg.Transport)
+	}
+
 	m.mu.Lock()
 	if pkt.Transport == "UDP" {
 		m.stats.UDPReceived++
@@ -132,6 +146,14 @@ func applyReceivedRport(msg *sip.Message) {
 }
 
 func (m *Manager) Send(msg *sip.Message, dst string, transport string) error {
+	if m.capture != nil {
+		host, portStr, err := net.SplitHostPort(dst)
+		if err == nil {
+			port, _ := strconv.Atoi(portStr)
+			m.capture("out", msg, host, port, transport)
+		}
+	}
+
 	data := msg.Serialize()
 
 	switch transport {

@@ -25,6 +25,11 @@ type Metrics struct {
 	Responses5xx atomic.Uint64
 	Responses6xx atomic.Uint64
 
+	DialogsActive    atomic.Int64
+	DialogsCreated   atomic.Uint64
+	DialogsCompleted atomic.Uint64
+	DialogsTimedOut  atomic.Uint64
+
 	delays *windowed
 	rates  *windowed
 }
@@ -74,6 +79,21 @@ func (m *Metrics) RecordLocallyAnswered() {
 
 func (m *Metrics) RecordDelay(ms int64) {
 	m.delays.add(1, ms)
+}
+
+func (m *Metrics) RecordDialogCreated() {
+	m.DialogsActive.Add(1)
+	m.DialogsCreated.Add(1)
+}
+
+func (m *Metrics) RecordDialogCompleted() {
+	m.DialogsActive.Add(-1)
+	m.DialogsCompleted.Add(1)
+}
+
+func (m *Metrics) RecordDialogTimedOut() {
+	m.DialogsActive.Add(-1)
+	m.DialogsTimedOut.Add(1)
 }
 
 func (m *Metrics) DelayStats(windowMin int) (count int64, avgMs int64) {

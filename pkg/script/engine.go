@@ -6,9 +6,11 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/dop251/goja"
 	"github.com/funsip/funsip/pkg/auth"
+	"github.com/funsip/funsip/pkg/dialog"
 	"github.com/funsip/funsip/pkg/media"
 	"github.com/funsip/funsip/pkg/proxy"
 	"github.com/funsip/funsip/pkg/registrar"
@@ -27,7 +29,10 @@ type Engine struct {
 	registrar *registrar.Registrar
 	auth      *auth.DigestAuth
 	db        *store.DB
+	dialogs   *dialog.Manager
 }
+
+func (e *Engine) SetDialogManager(m *dialog.Manager) { e.dialogs = m }
 
 func NewEngine(scriptPath string, p *proxy.Proxy, r *registrar.Registrar, a *auth.DigestAuth, db *store.DB) (*Engine, error) {
 	e := &Engine{
@@ -315,6 +320,38 @@ func (e *Engine) registerFunctions(vm *goja.Runtime, req *sip.Message) {
 		}
 		name := sip.NormalizeHeaderName(call.Argument(0).String())
 		req.Headers.Remove(name)
+		return goja.Undefined()
+	})
+
+	vm.Set("setupDialog", func(call goja.FunctionCall) goja.Value {
+		if e.dialogs == nil {
+			log.Printf("[script] setupDialog: dialog manager not configured")
+			return goja.Undefined()
+		}
+		opts := dialog.Options{}
+		if len(call.Arguments) > 0 {
+			if m, ok := call.Argument(0).Export().(map[string]interface{}); ok {
+				if v, ok := m["dlgGate"].(bool); ok {
+					opts.DlgGate = v
+				}
+				if v, ok := m["pcap"].(bool); ok {
+					opts.Pcap = v
+				}
+				switch t := m["timeout"].(type) {
+				case int64:
+					opts.Timeout = time.Duration(t) * time.Second
+				case float64:
+					opts.Timeout = time.Duration(t) * time.Second
+				case string:
+					if d, err := time.ParseDuration(t); err == nil {
+						opts.Timeout = d
+					}
+				}
+			}
+		}
+		if _, err := e.dialogs.Setup(req, opts); err != nil {
+			log.Printf("[script] setupDialog: %v", err)
+		}
 		return goja.Undefined()
 	})
 
