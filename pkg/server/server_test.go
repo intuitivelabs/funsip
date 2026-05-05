@@ -1290,6 +1290,247 @@ function onRequest(req) {
 // importing the package directly via a long path.
 func sdpParse(s string) (*sdp.SDP, error) { return sdp.Parse([]byte(s)) }
 
+// ---------- RTCP signaling mode tests ----------
+
+func TestRTCPImplicitPortAllocationIsConsecutive(t *testing.T) {
+	h := setupHarness(t)
+
+	offer := "v=0\r\no=a 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 30000 RTP/AVP 0\r\n"
+	answer := "v=0\r\no=b 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\n"
+	po, _ := sdp.Parse([]byte(offer))
+	pa, _ := sdp.Parse([]byte(answer))
+
+	sess := h.srv.Media.GetOrCreate("rtcp-implicit", media.Options{Symmetric: true, IdleTimeout: time.Hour})
+	if err := sess.AnchorOffer(po); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.AnchorAnswer(pa); err != nil {
+		t.Fatal(err)
+	}
+	stream := sess.Streams[0]
+
+	if stream.ARtcpPort() != stream.ARtpPort()+1 {
+		t.Errorf("A-side: rtcp port (%d) must be rtp port + 1 (%d)", stream.ARtcpPort(), stream.ARtpPort()+1)
+	}
+	if stream.BRtcpPort() != stream.BRtpPort()+1 {
+		t.Errorf("B-side: rtcp port (%d) must be rtp port + 1 (%d)", stream.BRtcpPort(), stream.BRtpPort()+1)
+	}
+
+	// Implicit RTCP: the rewritten SDP should not contain a=rtcp
+	// (because peer's implicit rtp+1 already lands on our rtcp port).
+	rendered := string(po.Bytes())
+	if strings.Contains(rendered, "a=rtcp:") {
+		t.Errorf("implicit-RTCP SDP should not have a=rtcp after rewrite:\n%s", rendered)
+	}
+	rendered = string(pa.Bytes())
+	if strings.Contains(rendered, "a=rtcp:") {
+		t.Errorf("implicit-RTCP answer should not have a=rtcp after rewrite:\n%s", rendered)
+	}
+}
+
+func TestRTCPExplicitAttrRewritten(t *testing.T) {
+	h := setupHarness(t)
+
+	// Original SDP has a=rtcp with a non-default port (NOT rtp+1).
+	offer := "v=0\r\no=a 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 30000 RTP/AVP 0\r\na=rtcp:30005 IN IP4 127.0.0.1\r\n"
+	po, _ := sdp.Parse([]byte(offer))
+
+	sess := h.srv.Media.GetOrCreate("rtcp-explicit", media.Options{Symmetric: true, IdleTimeout: time.Hour})
+	if err := sess.AnchorOffer(po); err != nil {
+		t.Fatal(err)
+	}
+	stream := sess.Streams[0]
+
+	port, _, ok := po.Media[0].RTCPAttr()
+	if !ok {
+		t.Fatal("rewritten SDP missing a=rtcp attribute")
+	}
+	if port != stream.ARtcpPort() {
+		t.Errorf("a=rtcp port = %d, want relay's a-rtcp port %d", port, stream.ARtcpPort())
+	}
+}
+
+func TestRTCPMuxPreserved(t *testing.T) {
+	h := setupHarness(t)
+
+	offer := "v=0\r\no=a 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 30000 RTP/AVP 0\r\na=rtcp-mux\r\n"
+	answer := "v=0\r\no=b 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtcp-mux\r\n"
+	po, _ := sdp.Parse([]byte(offer))
+	pa, _ := sdp.Parse([]byte(answer))
+
+	sess := h.srv.Media.GetOrCreate("rtcp-mux", media.Options{Symmetric: true, IdleTimeout: time.Hour})
+	if err := sess.AnchorOffer(po); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.AnchorAnswer(pa); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, parsed := range []*sdp.SDP{po, pa} {
+		rendered := string(parsed.Bytes())
+		if !strings.Contains(rendered, "a=rtcp-mux") {
+			t.Errorf("rtcp-mux dropped from rewrite:\n%s", rendered)
+		}
+		// With rtcp-mux and no original explicit a=rtcp, the rewrite
+		// must NOT introduce one (RFC5761: SHOULD NOT).
+		if strings.Contains(rendered, "a=rtcp:") {
+			t.Errorf("rtcp-mux + implicit should not produce a=rtcp:\n%s", rendered)
+		}
+	}
+}
+
+func TestRTCPMuxWithExplicitRtcpAttrAlignsToRtpPort(t *testing.T) {
+	h := setupHarness(t)
+
+	// RFC5761 §5.1.3: when rtcp-mux is used, an explicit a=rtcp port
+	// MUST equal the rtp port. We're given a (technically invalid)
+	// SDP where a=rtcp differs; the rewrite must still produce a
+	// valid mux SDP (a=rtcp port == m= port).
+	offer := "v=0\r\no=a 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 30000 RTP/AVP 0\r\na=rtcp-mux\r\na=rtcp:30000\r\n"
+	po, _ := sdp.Parse([]byte(offer))
+
+	sess := h.srv.Media.GetOrCreate("rtcp-mux-explicit", media.Options{Symmetric: true, IdleTimeout: time.Hour})
+	if err := sess.AnchorOffer(po); err != nil {
+		t.Fatal(err)
+	}
+	stream := sess.Streams[0]
+
+	rendered := string(po.Bytes())
+	if !strings.Contains(rendered, "a=rtcp-mux") {
+		t.Errorf("rtcp-mux dropped:\n%s", rendered)
+	}
+	port, _, _ := po.Media[0].RTCPAttr()
+	if port != stream.ARtpPort() {
+		t.Errorf("with mux, a=rtcp port (%d) must equal m= rtp port (%d)", port, stream.ARtpPort())
+	}
+}
+
+func TestRTCPPacketFlowAllModes(t *testing.T) {
+	t.Run("implicit", func(t *testing.T) {
+		h := setupHarness(t)
+
+		// Alice listens on consecutive ports (rtp + rtp+1).
+		aliceRtp, aliceRtcp := bindConsecutiveUDP(t)
+		defer aliceRtp.Close()
+		defer aliceRtcp.Close()
+		aliceRtpPort := aliceRtp.LocalAddr().(*net.UDPAddr).Port
+
+		offer := fmt.Sprintf("v=0\r\no=a 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio %d RTP/AVP 0\r\n", aliceRtpPort)
+		runRTCPFlow(t, h, "flow-implicit", offer, false /* rtcp goes to rtcp port */, aliceRtcp)
+	})
+
+	t.Run("explicit a=rtcp", func(t *testing.T) {
+		h := setupHarness(t)
+
+		// Alice's RTP and RTCP ports can be unrelated.
+		aliceRtp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer aliceRtp.Close()
+		aliceRtcp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer aliceRtcp.Close()
+		aliceRtpPort := aliceRtp.LocalAddr().(*net.UDPAddr).Port
+		aliceRtcpPort := aliceRtcp.LocalAddr().(*net.UDPAddr).Port
+
+		offer := fmt.Sprintf("v=0\r\no=a 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio %d RTP/AVP 0\r\na=rtcp:%d\r\n",
+			aliceRtpPort, aliceRtcpPort)
+		runRTCPFlow(t, h, "flow-explicit", offer, false, aliceRtcp)
+	})
+
+	t.Run("rtcp-mux", func(t *testing.T) {
+		h := setupHarness(t)
+
+		// One Alice socket — RTP and RTCP share it.
+		aliceRtp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer aliceRtp.Close()
+		aliceRtpPort := aliceRtp.LocalAddr().(*net.UDPAddr).Port
+
+		offer := fmt.Sprintf("v=0\r\no=a 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio %d RTP/AVP 0\r\na=rtcp-mux\r\n", aliceRtpPort)
+		runRTCPFlow(t, h, "flow-mux", offer, true /* rtcp shares rtp port */, aliceRtp)
+	})
+}
+
+// runRTCPFlow anchors a one-sided session for `offer`, sends a
+// synthetic RTCP packet to the relay's A-side RTCP destination, and
+// verifies the packet shows up at `expectedRx`.
+func runRTCPFlow(t *testing.T, h *harness, callID, offer string, mux bool, expectedRx *net.UDPConn) {
+	t.Helper()
+	po, err := sdp.Parse([]byte(offer))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Asymmetric mode so we don't have to send a "priming" packet
+	// from Alice to teach the relay her source address.
+	sess := h.srv.Media.GetOrCreate(callID, media.Options{
+		Symmetric:   false,
+		IdleTimeout: time.Hour,
+	})
+	if err := sess.AnchorOffer(po); err != nil {
+		t.Fatal(err)
+	}
+	stream := sess.Streams[0]
+
+	// Where would the peer send RTCP through the relay? With mux it
+	// is the same port the peer uses for RTP (the relay's A-side rtp
+	// port); without mux, it is the relay's A-side rtcp port.
+	dstPort := stream.ARtcpPort()
+	if mux {
+		dstPort = stream.ARtpPort()
+	}
+	relayDst := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: dstPort}
+
+	tx, err := net.DialUDP("udp4", nil, relayDst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Close()
+
+	payload := []byte("rtcp-payload-" + callID)
+	if _, err := tx.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+
+	expectedRx.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 65535)
+	n, _, err := expectedRx.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("expected receiver did not get forwarded packet: %v", err)
+	}
+	if !bytes.Equal(buf[:n], payload) {
+		t.Errorf("payload mismatch: got %q, want %q", buf[:n], payload)
+	}
+}
+
+// bindConsecutiveUDP binds two UDP sockets on 127.0.0.1 with the
+// second port being one higher than the first. Mirrors the relay's
+// own port-pair allocation so test scaffolding can simulate a peer
+// that uses implicit RTCP signaling.
+func bindConsecutiveUDP(t *testing.T) (*net.UDPConn, *net.UDPConn) {
+	t.Helper()
+	for i := 0; i < 50; i++ {
+		rtp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rtpPort := rtp.LocalAddr().(*net.UDPAddr).Port
+		rtcp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: rtpPort + 1})
+		if err == nil {
+			return rtp, rtcp
+		}
+		rtp.Close()
+	}
+	t.Fatal("could not bind consecutive UDP port pair")
+	return nil, nil
+}
+
 // ---------- Media port lifecycle tests ----------
 
 func TestBYEReleasesMediaPorts(t *testing.T) {

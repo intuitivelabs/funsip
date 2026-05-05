@@ -238,17 +238,48 @@ func (s *Session) AnchorOffer(in *sdp.SDP) error {
 		if m.Connection != nil {
 			m.Connection.Address = s.manager.localIP
 		}
-		if _, _, ok := m.RTCPAttr(); ok {
-			m.SetRTCPAttr(stream.aRtcpPort, "")
-		} else if rtcpPort != rtpPort+1 {
-			m.SetRTCPAttr(stream.aRtcpPort, "")
-		}
+		rewriteRTCP(m, stream.aRtpPort, stream.aRtcpPort)
 	}
 
 	if in.Connection != nil {
 		in.Connection.Address = s.manager.localIP
 	}
 	return nil
+}
+
+// rewriteRTCP fixes up the RTCP signaling in a media descriptor whose
+// m= port has just been changed to relayRtpPort. There are three
+// signaling modes to preserve:
+//
+//   - a=rtcp-mux (RFC5761): RTP and RTCP share the m= port. Keep the
+//     attribute. If a=rtcp was also present, RFC5761 requires its
+//     port to equal the rtp port — rewrite accordingly.
+//
+//   - a=rtcp:port (RFC3605, no mux): explicit RTCP port. Rewrite the
+//     attribute to point at relayRtcpPort so the peer sends RTCP to
+//     a port we actually listen on.
+//
+//   - implicit (no a=rtcp, no rtcp-mux): the peer assumes rtp+1.
+//     Because the relay always allocates relayRtcpPort = relayRtpPort+1,
+//     no a=rtcp attribute needs to be emitted — the peer's implicit
+//     calculation already matches our listening port.
+func rewriteRTCP(m *sdp.Media, relayRtpPort, relayRtcpPort int) {
+	hasMux := m.HasAttr("rtcp-mux")
+	_, _, hasExplicit := m.RTCPAttr()
+
+	switch {
+	case hasMux:
+		if hasExplicit {
+			// Per RFC5761 the explicit rtcp port must equal the rtp
+			// port when rtcp-mux is in use.
+			m.SetRTCPAttr(relayRtpPort, "")
+		}
+	case hasExplicit:
+		m.SetRTCPAttr(relayRtcpPort, "")
+	default:
+		// Implicit — nothing to add. relayRtcpPort == relayRtpPort+1
+		// by construction.
+	}
 }
 
 // AnchorAnswer is the same as AnchorOffer but for the answer SDP and
@@ -293,11 +324,7 @@ func (s *Session) AnchorAnswer(in *sdp.SDP) error {
 		if m.Connection != nil {
 			m.Connection.Address = s.manager.localIP
 		}
-		if _, _, ok := m.RTCPAttr(); ok {
-			m.SetRTCPAttr(stream.bRtcpPort, "")
-		} else if rtcpPort != rtpPort+1 {
-			m.SetRTCPAttr(stream.bRtcpPort, "")
-		}
+		rewriteRTCP(m, stream.bRtpPort, stream.bRtcpPort)
 	}
 
 	if in.Connection != nil {
@@ -411,23 +438,51 @@ func (s *Stream) BRtpPort() int  { return s.bRtpPort }
 func (s *Stream) ARtcpPort() int { return s.aRtcpPort }
 func (s *Stream) BRtcpPort() int { return s.bRtcpPort }
 
+// allocate binds two consecutive UDP port pairs on localIP — one pair
+// for the A side (rtp + rtcp = rtp+1) and one for the B side. The
+// consecutive layout means implicit RTCP signaling (no a=rtcp, peer
+// computes rtp+1) just works without rewriting the SDP, and explicit
+// rewriting can simply emit a=rtcp:<rtcp-port>.
 func (s *Stream) allocate(localIP string) error {
-	addr := net.ParseIP(localIP)
-
-	conns := []**net.UDPConn{&s.aRtpConn, &s.aRtcpConn, &s.bRtpConn, &s.bRtcpConn}
-	ports := []*int{&s.aRtpPort, &s.aRtcpPort, &s.bRtpPort, &s.bRtcpPort}
-
-	for i, c := range conns {
-		conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: addr, Port: 0})
-		if err != nil {
-			s.closeAll()
-			return fmt.Errorf("allocate udp socket: %w", err)
-		}
-		*c = conn
-		*ports[i] = conn.LocalAddr().(*net.UDPAddr).Port
+	rtp, rtcp, rtpPort, rtcpPort, err := allocateConsecutivePair(localIP)
+	if err != nil {
+		return fmt.Errorf("allocate A-side: %w", err)
 	}
+	s.aRtpConn, s.aRtcpConn, s.aRtpPort, s.aRtcpPort = rtp, rtcp, rtpPort, rtcpPort
+
+	rtp, rtcp, rtpPort, rtcpPort, err = allocateConsecutivePair(localIP)
+	if err != nil {
+		s.aRtpConn.Close()
+		s.aRtcpConn.Close()
+		return fmt.Errorf("allocate B-side: %w", err)
+	}
+	s.bRtpConn, s.bRtcpConn, s.bRtpPort, s.bRtcpPort = rtp, rtcp, rtpPort, rtcpPort
+
 	s.lastActivity.Store(time.Now().UnixNano())
 	return nil
+}
+
+// allocateConsecutivePair binds an RTP socket on a free local port
+// and then the next port for RTCP. If the consecutive port is taken,
+// it retries with a fresh RTP port. After several attempts it gives
+// up — in practice this almost always succeeds on the first try.
+func allocateConsecutivePair(localIP string) (rtp, rtcp *net.UDPConn, rtpPort, rtcpPort int, err error) {
+	addr := net.ParseIP(localIP)
+	const maxAttempts = 50
+	for i := 0; i < maxAttempts; i++ {
+		rtp, err = net.ListenUDP("udp4", &net.UDPAddr{IP: addr, Port: 0})
+		if err != nil {
+			return nil, nil, 0, 0, err
+		}
+		rtpPort = rtp.LocalAddr().(*net.UDPAddr).Port
+		rtcp, err = net.ListenUDP("udp4", &net.UDPAddr{IP: addr, Port: rtpPort + 1})
+		if err == nil {
+			rtcpPort = rtpPort + 1
+			return rtp, rtcp, rtpPort, rtcpPort, nil
+		}
+		rtp.Close()
+	}
+	return nil, nil, 0, 0, fmt.Errorf("could not allocate consecutive RTP/RTCP port pair after %d attempts", maxAttempts)
 }
 
 func (s *Stream) start() {
