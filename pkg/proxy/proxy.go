@@ -8,12 +8,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/funsip/funsip/pkg/media"
-	"github.com/funsip/funsip/pkg/metrics"
-	"github.com/funsip/funsip/pkg/sdp"
-	"github.com/funsip/funsip/pkg/sip"
-	"github.com/funsip/funsip/pkg/store"
-	"github.com/funsip/funsip/pkg/transaction"
+	"github.com/intuitivelabs/funsip/pkg/media"
+	"github.com/intuitivelabs/funsip/pkg/metrics"
+	"github.com/intuitivelabs/funsip/pkg/sdp"
+	"github.com/intuitivelabs/funsip/pkg/sip"
+	"github.com/intuitivelabs/funsip/pkg/store"
+	"github.com/intuitivelabs/funsip/pkg/transaction"
 )
 
 type Proxy struct {

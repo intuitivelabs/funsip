@@ -24,10 +24,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/funsip/funsip/pkg/metrics"
-	"github.com/funsip/funsip/pkg/pcap"
-	"github.com/funsip/funsip/pkg/sip"
-	"github.com/funsip/funsip/pkg/transaction"
+	"github.com/intuitivelabs/funsip/pkg/metrics"
+	"github.com/intuitivelabs/funsip/pkg/pcap"
+	"github.com/intuitivelabs/funsip/pkg/sip"
+	"github.com/intuitivelabs/funsip/pkg/transaction"
 )
 
 const DefaultTimeout = 61 * time.Minute

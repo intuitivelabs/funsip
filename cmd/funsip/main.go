@@ -7,9 +7,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/funsip/funsip/pkg/config"
-	"github.com/funsip/funsip/pkg/management"
-	"github.com/funsip/funsip/pkg/server"
+	"github.com/intuitivelabs/funsip/pkg/config"
+	"github.com/intuitivelabs/funsip/pkg/management"
+	"github.com/intuitivelabs/funsip/pkg/server"
 )
 
 func main() {

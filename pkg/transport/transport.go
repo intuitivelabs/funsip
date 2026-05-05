@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/funsip/funsip/pkg/sip"
+	"github.com/intuitivelabs/funsip/pkg/sip"
 )
 
 type Packet struct {

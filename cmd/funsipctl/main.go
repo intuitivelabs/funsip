@@ -9,8 +9,8 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/funsip/funsip/pkg/auth"
-	"github.com/funsip/funsip/pkg/store"
+	"github.com/intuitivelabs/funsip/pkg/auth"
+	"github.com/intuitivelabs/funsip/pkg/store"
 )
 
 func main() {

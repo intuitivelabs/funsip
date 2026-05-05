@@ -30,7 +30,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/funsip/funsip/pkg/sdp"
+	"github.com/intuitivelabs/funsip/pkg/sdp"
 )
 
 type Options struct {

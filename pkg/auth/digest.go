@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/funsip/funsip/pkg/sip"
-	"github.com/funsip/funsip/pkg/store"
+	"github.com/intuitivelabs/funsip/pkg/sip"
+	"github.com/intuitivelabs/funsip/pkg/store"
 )
 
 type DigestAuth struct {

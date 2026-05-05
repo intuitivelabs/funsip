@@ -14,13 +14,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/funsip/funsip/pkg/auth"
-	"github.com/funsip/funsip/pkg/config"
-	"github.com/funsip/funsip/pkg/dialog"
-	"github.com/funsip/funsip/pkg/media"
-	"github.com/funsip/funsip/pkg/sdp"
-	"github.com/funsip/funsip/pkg/server"
-	"github.com/funsip/funsip/pkg/store"
+	"github.com/intuitivelabs/funsip/pkg/auth"
+	"github.com/intuitivelabs/funsip/pkg/config"
+	"github.com/intuitivelabs/funsip/pkg/dialog"
+	"github.com/intuitivelabs/funsip/pkg/media"
+	"github.com/intuitivelabs/funsip/pkg/sdp"
+	"github.com/intuitivelabs/funsip/pkg/server"
+	"github.com/intuitivelabs/funsip/pkg/store"
 )
 
 const testScript = `

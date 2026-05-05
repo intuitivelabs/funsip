@@ -1,4 +1,4 @@
-module github.com/funsip/funsip
+module github.com/intuitivelabs/funsip
 
 go 1.22
 

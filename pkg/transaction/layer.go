@@ -7,8 +7,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/funsip/funsip/pkg/metrics"
-	"github.com/funsip/funsip/pkg/sip"
+	"github.com/intuitivelabs/funsip/pkg/metrics"
+	"github.com/intuitivelabs/funsip/pkg/sip"
 )
 
 type Layer struct {

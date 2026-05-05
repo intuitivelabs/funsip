@@ -9,13 +9,13 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
-	"github.com/funsip/funsip/pkg/auth"
-	"github.com/funsip/funsip/pkg/dialog"
-	"github.com/funsip/funsip/pkg/media"
-	"github.com/funsip/funsip/pkg/proxy"
-	"github.com/funsip/funsip/pkg/registrar"
-	"github.com/funsip/funsip/pkg/sip"
-	"github.com/funsip/funsip/pkg/store"
+	"github.com/intuitivelabs/funsip/pkg/auth"
+	"github.com/intuitivelabs/funsip/pkg/dialog"
+	"github.com/intuitivelabs/funsip/pkg/media"
+	"github.com/intuitivelabs/funsip/pkg/proxy"
+	"github.com/intuitivelabs/funsip/pkg/registrar"
+	"github.com/intuitivelabs/funsip/pkg/sip"
+	"github.com/intuitivelabs/funsip/pkg/store"
 )
 
 type Engine struct {

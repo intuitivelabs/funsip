@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/funsip/funsip/pkg/sip"
+	"github.com/intuitivelabs/funsip/pkg/sip"
 )
 
 type ServerTx struct {

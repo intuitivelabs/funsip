@@ -9,11 +9,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/funsip/funsip/pkg/metrics"
-	"github.com/funsip/funsip/pkg/script"
-	"github.com/funsip/funsip/pkg/store"
-	"github.com/funsip/funsip/pkg/transaction"
-	"github.com/funsip/funsip/pkg/transport"
+	"github.com/intuitivelabs/funsip/pkg/metrics"
+	"github.com/intuitivelabs/funsip/pkg/script"
+	"github.com/intuitivelabs/funsip/pkg/store"
+	"github.com/intuitivelabs/funsip/pkg/transaction"
+	"github.com/intuitivelabs/funsip/pkg/transport"
 )
 
 const Version = metrics.Version
