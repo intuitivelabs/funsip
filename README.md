@@ -79,14 +79,26 @@ The routing script is JavaScript executed for each out-of-dialog or dialog-initi
 | Function | Description |
 |---|---|
 | `authenticate(realm)` | Challenge/verify digest credentials. Returns `true` if authenticated, sends 401/407 challenge and returns `false` otherwise. |
-| `fixContact(req)` | Rewrite Contact header with the actual source IP:port (NAT traversal). |
-| `processRegister(req)` | Save/remove registrations and send 200 OK with current bindings. |
+| `fixContact()` | Rewrite Contact header with the actual source IP:port (NAT traversal). |
+| `processRegister()` | Save/remove registrations and send 200 OK with current bindings. |
 | `sendResponse(code, reason)` | Send a SIP response to the current request. |
+| `sendResponse(code, reason, headers)` | Same as above, plus extra response headers. `headers` is an object `{"X-Foo": "bar", "X-List": ["a", "b"]}` or an array of `"Name: value"` strings. |
+| `appendHeader(name, value)` | Append a header to the current request (also propagates into anything proxied afterwards). Multiple calls add multiple values. |
+| `removeHeader(name)` | Remove all instances of a header by name. Compact forms (e.g. `"v"` for `Via`, `"f"` for `From`) are accepted. |
 | `lookup()` | Look up registered contacts for the Request-URI. Returns array of binding objects. |
 | `lookup(uriString)` | Look up registered contacts for a specific URI. |
 | `proxy(binding)` | Forward request to a registered contact (uses received IP:port). |
 | `proxyTo(destination, transport)` | Forward request to a fixed destination (e.g. `"10.0.0.1:5060"`). |
 | `log(...)` | Write to the server log. |
+
+### Implicit SIP behaviour (NOT in the script)
+
+The transaction layer handles these automatically — your routing script will not see them:
+
+- **ACK retransmissions** are absorbed by the INVITE server transaction.
+- **100 Trying** is generated for each INVITE server transaction.
+- **CANCEL matching a pending INVITE** (RFC3261 §9.2): a 200 OK is sent for the CANCEL; CANCEL is forwarded on every INVITE branch still in `Calling` or `Proceeding` (i.e. that has not received a final response); a 487 Request Terminated is sent for the INVITE if no final response has been forwarded yet. Only orphan CANCELs (no matching INVITE) reach the routing script.
+- **Retransmissions** of any kind are absorbed by the matching transaction.
 
 ### Request object properties
 
@@ -121,16 +133,23 @@ function onRequest(req) {
         return;
     }
 
-    if (/^(INVITE|MESSAGE)$/.test(req.method)) {
-        if (req.from && req.from.host === DOMAIN) {
+    if (/^(INVITE|MESSAGE|CANCEL)$/.test(req.method)) {
+        // CANCEL cannot carry meaningful credentials; skip auth for it.
+        // (Note: a CANCEL that matches a pending INVITE never reaches the
+        // script — the SIP stack handles it implicitly. This branch only
+        // sees orphan CANCELs.)
+        if (req.method !== "CANCEL" && req.from && req.from.host === DOMAIN) {
             if (!authenticate(DOMAIN)) return;
         }
+
+        appendHeader("X-Routed-By", "funsip");
+        removeHeader("Privacy");
 
         var contacts = lookup();
         if (contacts && contacts.length > 0) {
             proxy(contacts[0]);
         } else {
-            sendResponse(404, "Not Found");
+            sendResponse(404, "Not Found", {"X-Reason": "no registration"});
         }
         return;
     }

@@ -92,9 +92,11 @@ func NewClientNonInviteTx(
 	return tx
 }
 
-func (tx *ClientTx) Key() Key         { return tx.key }
-func (tx *ClientTx) Type() Type       { return tx.txType }
+func (tx *ClientTx) Key() Key             { return tx.key }
+func (tx *ClientTx) Type() Type           { return tx.txType }
 func (tx *ClientTx) CreatedAt() time.Time { return tx.createdAt }
+func (tx *ClientTx) Dest() string         { return tx.dest }
+func (tx *ClientTx) Transport() string    { return tx.transport }
 
 func (tx *ClientTx) State() State {
 	tx.mu.Lock()

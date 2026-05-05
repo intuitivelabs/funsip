@@ -35,8 +35,9 @@ function onRequest(req) {
         return;
     }
 
-    if (/^(INVITE|MESSAGE|SUBSCRIBE)$/.test(req.method)) {
-        if (req.from && req.from.host === DOMAIN) {
+    if (/^(INVITE|MESSAGE|SUBSCRIBE|CANCEL)$/.test(req.method)) {
+        // CANCEL cannot be authenticated; orphan CANCELs reach this point.
+        if (req.method !== "CANCEL" && req.from && req.from.host === DOMAIN) {
             if (!authenticate(DOMAIN)) return;
         }
 
@@ -47,11 +48,6 @@ function onRequest(req) {
         } else {
             sendResponse(404, "Not Found");
         }
-        return;
-    }
-
-    if (req.method === "CANCEL") {
-        sendResponse(200, "OK");
         return;
     }
 
@@ -585,6 +581,238 @@ func TestDeployInvalidScript(t *testing.T) {
 	}
 }
 
+func TestCancelMatchedInvite(t *testing.T) {
+	h := setupHarness(t)
+	h.addSubscriber("bob", "test.local", "bobpass")
+
+	// Sink socket to receive what the proxy forwards upstream.
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkPort := sinkConn.LocalAddr().(*net.UDPAddr).Port
+
+	// Pre-register alice with binding to the sink so the proxy forwards there.
+	if err := h.srv.DB.SaveBinding(&store.Binding{
+		AOR:          "sip:alice@test.local",
+		Contact:      fmt.Sprintf("sip:alice@127.0.0.1:%d", sinkPort),
+		ReceivedIP:   "127.0.0.1",
+		ReceivedPort: sinkPort,
+		Transport:    "UDP",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	bobNonce := getNonceForUser(t, h, "bob")
+	authHeader := buildDigestAuth("bob", "test.local", "bobpass", bobNonce, "INVITE", "sip:alice@test.local")
+
+	callID := "cancel-test-call"
+	branch := fmt.Sprintf("z9hG4bK%d-cancel", time.Now().UnixNano())
+	fromTag := "bob-cancel-tag"
+
+	invite := buildRequestExplicit("INVITE", "sip:alice@test.local", h.clientAddr.Port,
+		"bob", "alice", callID, 1, branch, fromTag,
+		[]string{
+			fmt.Sprintf("Contact: <sip:bob@127.0.0.1:%d>", h.clientAddr.Port),
+			"Authorization: " + authHeader,
+		}, "")
+
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(invite), target); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for the proxy to forward the INVITE to the sink.
+	sinkConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 65535)
+	n, _, err := sinkConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("sink did not receive forwarded INVITE: %v", err)
+	}
+	fwd := string(buf[:n])
+	if !strings.HasPrefix(fwd, "INVITE ") {
+		t.Errorf("expected forwarded INVITE, got prefix: %q", firstLine(fwd))
+	}
+
+	// Bob sends CANCEL with the same branch / Call-ID / From-tag.
+	cancel := buildRequestExplicit("CANCEL", "sip:alice@test.local", h.clientAddr.Port,
+		"bob", "alice", callID, 1, branch, fromTag, nil, "")
+	if _, err := h.clientConn.WriteToUDP([]byte(cancel), target); err != nil {
+		t.Fatal(err)
+	}
+
+	var got200, got487 bool
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && (!got200 || !got487) {
+		h.clientConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		buf := make([]byte, 65535)
+		n, _, err := h.clientConn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		msg := string(buf[:n])
+		code, _ := parseStatusLine(msg)
+		cseq := extractHeader(msg, "CSeq")
+		switch {
+		case code == 200 && strings.Contains(cseq, "CANCEL"):
+			got200 = true
+		case code == 487 && strings.Contains(cseq, "INVITE"):
+			got487 = true
+		}
+	}
+	if !got200 {
+		t.Error("did not receive 200 OK for CANCEL")
+	}
+	if !got487 {
+		t.Error("did not receive 487 Request Terminated for INVITE")
+	}
+
+	// Sink should also receive the forwarded CANCEL on the same branch.
+	sinkConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	deadline2 := time.Now().Add(2 * time.Second)
+	var sawCancel bool
+	for time.Now().Before(deadline2) && !sawCancel {
+		sinkConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		n, _, err := sinkConn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		if strings.HasPrefix(string(buf[:n]), "CANCEL ") {
+			sawCancel = true
+		}
+	}
+	if !sawCancel {
+		t.Error("sink did not receive forwarded CANCEL on the pending branch")
+	}
+}
+
+func TestCancelOrphanGoesThroughScript(t *testing.T) {
+	h := setupHarness(t)
+
+	// CANCEL with no matching INVITE — the script processes it. Since
+	// nobody is registered for "nobody@test.local" the script returns 404.
+	cancel := buildRequest("CANCEL", "sip:nobody@test.local", h.clientAddr.Port,
+		"alice", "nobody", "orphan-cancel", 1, nil, "")
+
+	resp := h.sendSIP(cancel)
+	code, _ := parseStatusLine(resp)
+
+	if code == 401 || code == 407 {
+		t.Errorf("orphan CANCEL got auth challenge %d (CANCEL must not be authenticated)", code)
+	}
+	if code != 404 {
+		t.Errorf("expected 404 for orphan CANCEL with no destination, got %d", code)
+	}
+}
+
+func TestAppendAndRemoveHeader(t *testing.T) {
+	h := setupHarness(t)
+
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkPort := sinkConn.LocalAddr().(*net.UDPAddr).Port
+
+	if err := h.srv.DB.SaveBinding(&store.Binding{
+		AOR:          "sip:dest@test.local",
+		Contact:      fmt.Sprintf("sip:dest@127.0.0.1:%d", sinkPort),
+		ReceivedIP:   "127.0.0.1",
+		ReceivedPort: sinkPort,
+		Transport:    "UDP",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	script := `
+function onRequest(req) {
+    appendHeader("X-Funsip", "first");
+    appendHeader("X-Funsip", "second");
+    removeHeader("Subject");
+    // Compact form: "v" should resolve to Via — but Via is critical so we
+    // just test compact-form resolution via a non-mandatory header.
+    removeHeader("s");  // also Subject in compact form
+    var contacts = lookup();
+    if (contacts.length > 0) proxy(contacts[0]);
+    else sendResponse(404, "Not Found");
+}
+`
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy failed: %v", r)
+	}
+
+	msg := buildRequest("MESSAGE", "sip:dest@test.local", h.clientAddr.Port,
+		"ext", "dest", "header-test", 1,
+		[]string{"Subject: should be removed", "Content-Type: text/plain"}, "hi")
+
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(msg), target); err != nil {
+		t.Fatal(err)
+	}
+
+	sinkConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 65535)
+	n, _, err := sinkConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("sink did not receive forwarded message: %v", err)
+	}
+	fwd := string(buf[:n])
+
+	if !strings.Contains(fwd, "X-Funsip: first") {
+		t.Errorf("X-Funsip: first missing in forwarded request:\n%s", fwd)
+	}
+	if !strings.Contains(fwd, "X-Funsip: second") {
+		t.Errorf("X-Funsip: second missing in forwarded request:\n%s", fwd)
+	}
+	for _, line := range strings.Split(fwd, "\r\n") {
+		if strings.HasPrefix(strings.ToLower(line), "subject:") {
+			t.Errorf("Subject header was not removed:\n%s", fwd)
+		}
+	}
+}
+
+func TestSendResponseWithHeaders(t *testing.T) {
+	h := setupHarness(t)
+
+	script := `
+function onRequest(req) {
+    sendResponse(486, "Busy Here", {"Retry-After": "60", "X-Reason": "test"});
+}
+`
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy failed: %v", r)
+	}
+
+	msg := buildRequest("OPTIONS", "sip:test.local", h.clientAddr.Port,
+		"alice", "x", "sendresp-headers", 1, nil, "")
+	resp := h.sendSIP(msg)
+
+	code, _ := parseStatusLine(resp)
+	if code != 486 {
+		t.Fatalf("expected 486, got %d\n%s", code, resp)
+	}
+	if got := extractHeader(resp, "Retry-After"); got != "60" {
+		t.Errorf("Retry-After: expected 60, got %q", got)
+	}
+	if got := extractHeader(resp, "X-Reason"); got != "test" {
+		t.Errorf("X-Reason: expected 'test', got %q", got)
+	}
+}
+
+func firstLine(s string) string {
+	if idx := strings.IndexByte(s, '\r'); idx > 0 {
+		return s[:idx]
+	}
+	if idx := strings.IndexByte(s, '\n'); idx > 0 {
+		return s[:idx]
+	}
+	return s
+}
+
 func TestTransactionRetransmissionAbsorbed(t *testing.T) {
 	h := setupHarness(t)
 
@@ -672,13 +900,18 @@ func getInt(m map[string]interface{}, key string) int64 {
 }
 
 func buildRequest(method, ruri string, viaPort int, fromUser, toUser, callID string, cseq int, extra []string, body string) string {
-	var sb strings.Builder
 	branch := fmt.Sprintf("z9hG4bK%d-%s", time.Now().UnixNano(), callID)
+	fromTag := callID + "-tag"
+	return buildRequestExplicit(method, ruri, viaPort, fromUser, toUser, callID, cseq, branch, fromTag, extra, body)
+}
+
+func buildRequestExplicit(method, ruri string, viaPort int, fromUser, toUser, callID string, cseq int, branch, fromTag string, extra []string, body string) string {
+	var sb strings.Builder
 
 	fmt.Fprintf(&sb, "%s %s SIP/2.0\r\n", method, ruri)
 	fmt.Fprintf(&sb, "Via: SIP/2.0/UDP 127.0.0.1:%d;branch=%s;rport\r\n", viaPort, branch)
 	fmt.Fprintf(&sb, "Max-Forwards: 70\r\n")
-	fmt.Fprintf(&sb, "From: <sip:%s@test.local>;tag=%s-tag\r\n", fromUser, callID)
+	fmt.Fprintf(&sb, "From: <sip:%s@test.local>;tag=%s\r\n", fromUser, fromTag)
 	fmt.Fprintf(&sb, "To: <sip:%s@test.local>\r\n", toUser)
 	fmt.Fprintf(&sb, "Call-ID: %s\r\n", callID)
 	fmt.Fprintf(&sb, "CSeq: %d %s\r\n", cseq, method)

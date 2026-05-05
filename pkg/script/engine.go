@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/dop251/goja"
@@ -289,7 +290,30 @@ func (e *Engine) registerFunctions(vm *goja.Runtime, req *sip.Message) {
 		if len(call.Arguments) > 1 {
 			reason = call.Argument(1).String()
 		}
-		e.proxy.SendResponse(req, code, reason)
+		resp := sip.CreateResponseFromRequest(req, code, reason)
+		if len(call.Arguments) > 2 {
+			applyExtraHeaders(resp, call.Argument(2), vm)
+		}
+		e.proxy.SendResponseMsg(req, resp)
+		return goja.Undefined()
+	})
+
+	vm.Set("appendHeader", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 2 {
+			return goja.Undefined()
+		}
+		name := call.Argument(0).String()
+		value := call.Argument(1).String()
+		req.Headers.Add(name, value)
+		return goja.Undefined()
+	})
+
+	vm.Set("removeHeader", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			return goja.Undefined()
+		}
+		name := sip.NormalizeHeaderName(call.Argument(0).String())
+		req.Headers.Remove(name)
 		return goja.Undefined()
 	})
 
@@ -405,4 +429,60 @@ func objInt(obj *goja.Object, key string) int64 {
 		return 0
 	}
 	return v.ToInteger()
+}
+
+// applyExtraHeaders adds the headers described by val to msg. val may be:
+//   - an object whose keys are header names and values are strings (or
+//     arrays of strings for multi-value headers), e.g. {"X-Foo": "bar"}.
+//   - an array of "Name: value" strings, e.g. ["X-Foo: bar"].
+func applyExtraHeaders(msg *sip.Message, val goja.Value, vm *goja.Runtime) {
+	if val == nil || goja.IsUndefined(val) || goja.IsNull(val) {
+		return
+	}
+	exported := val.Export()
+
+	if list, ok := exported.([]interface{}); ok {
+		for _, item := range list {
+			s, ok := item.(string)
+			if !ok {
+				continue
+			}
+			colon := indexByteOrEnd(s, ':')
+			if colon < 0 || colon == len(s) {
+				continue
+			}
+			name := strings.TrimSpace(s[:colon])
+			value := strings.TrimSpace(s[colon+1:])
+			if name != "" {
+				msg.Headers.Add(name, value)
+			}
+		}
+		return
+	}
+
+	if m, ok := exported.(map[string]interface{}); ok {
+		for k, v := range m {
+			switch vv := v.(type) {
+			case string:
+				msg.Headers.Add(k, vv)
+			case []interface{}:
+				for _, item := range vv {
+					if s, ok := item.(string); ok {
+						msg.Headers.Add(k, s)
+					}
+				}
+			default:
+				msg.Headers.Add(k, fmt.Sprintf("%v", v))
+			}
+		}
+	}
+}
+
+func indexByteOrEnd(s string, c byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
 }

@@ -281,7 +281,14 @@ func parseStatusLine(msg *Message, line string) error {
 }
 
 func expandCompactHeader(name string) string {
-	switch name {
+	return NormalizeHeaderName(name)
+}
+
+// NormalizeHeaderName returns the long form of a SIP header name. The
+// parser stores all headers in long form, so this is the canonical lookup
+// for both compact ("v") and long ("Via") spellings.
+func NormalizeHeaderName(name string) string {
+	switch strings.ToLower(name) {
 	case "v":
 		return "Via"
 	case "f":
@@ -302,6 +309,16 @@ func expandCompactHeader(name string) string {
 		return "Subject"
 	case "e":
 		return "Content-Encoding"
+	case "x":
+		return "Session-Expires"
+	case "r":
+		return "Refer-To"
+	case "b":
+		return "Referred-By"
+	case "o":
+		return "Event"
+	case "u":
+		return "Allow-Events"
 	}
 	return name
 }

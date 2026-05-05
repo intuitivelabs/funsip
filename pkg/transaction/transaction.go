@@ -111,6 +111,22 @@ func MakeServerKey(msg *sip.Message) Key {
 	}
 }
 
+// MakeInviteKeyFromCancel returns the server transaction key of the INVITE
+// that the given CANCEL request is targeting, per RFC3261 §9.2 — same Via
+// branch and sent-by, method "INVITE".
+func MakeInviteKeyFromCancel(cancel *sip.Message) Key {
+	via := cancel.TopVia()
+	if via == nil {
+		return Key{}
+	}
+	return Key{
+		Branch:   via.Branch(),
+		Method:   "INVITE",
+		SentBy:   via.SentBy(),
+		IsClient: false,
+	}
+}
+
 func MakeClientKey(msg *sip.Message) Key {
 	via := msg.TopVia()
 	if via == nil {

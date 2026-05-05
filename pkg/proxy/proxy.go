@@ -84,7 +84,7 @@ func (p *Proxy) ForwardRequest(req *sip.Message, dst string, transport string) e
 		fwd.RequestURI.User = req.RequestURI.User
 	}
 
-	_, err := p.txLayer.NewClientTx(fwd, fullDst, transport, func(resp *sip.Message) {
+	_, err := p.txLayer.NewClientTxFor(req, fwd, fullDst, transport, func(resp *sip.Message) {
 		p.forwardResponse(req, resp)
 	})
 	return err
@@ -133,7 +133,7 @@ func (p *Proxy) ForwardToBinding(req *sip.Message, binding *store.Binding) error
 		fwd.RequestURI = contactURI
 	}
 
-	_, err = p.txLayer.NewClientTx(fwd, dst, transport, func(resp *sip.Message) {
+	_, err = p.txLayer.NewClientTxFor(req, fwd, dst, transport, func(resp *sip.Message) {
 		p.forwardResponse(req, resp)
 	})
 	return err
@@ -209,7 +209,7 @@ func (p *Proxy) ForwardInDialog(req *sip.Message) error {
 
 	p.removeProxyAuth(fwd)
 
-	_, err := p.txLayer.NewClientTx(fwd, dst, transport, func(resp *sip.Message) {
+	_, err := p.txLayer.NewClientTxFor(req, fwd, dst, transport, func(resp *sip.Message) {
 		p.forwardResponse(req, resp)
 	})
 	return err
