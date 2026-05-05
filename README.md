@@ -36,40 +36,64 @@ Copyright © 2026 ipteles s.r.o. Licensed under the GNU General Public License v
 - **HTTP/JSON management API** — status, transactions, stats, logs (ring buffer), hot reload
 - **CLI tool** — subscriber/location database management, server status queries
 
-## Quick Start
+## Install
+
+The fastest way — install the three binaries straight into `$GOBIN` (or `$GOPATH/bin`, or `~/go/bin`):
 
 ```bash
-# Run tests (integration tests cover REGISTER/auth, OPTIONS, INVITE,
-# retransmission absorption, and the management API)
+go install github.com/intuitivelabs/funsip/cmd/funsip@latest
+go install github.com/intuitivelabs/funsip/cmd/funsipctl@latest
+go install github.com/intuitivelabs/funsip/cmd/funsiptop@latest
+```
+
+Make sure that directory is on your `PATH` (e.g. `export PATH="$PATH:$(go env GOPATH)/bin"`).
+
+You'll still want a routing script on disk — grab the example:
+
+```bash
+curl -O https://raw.githubusercontent.com/intuitivelabs/funsip/main/scripts/route.js
+```
+
+## Build from source
+
+```bash
+git clone https://github.com/intuitivelabs/funsip.git
+cd funsip
+
+# Run tests (cover REGISTER/auth, OPTIONS, INVITE, retransmission
+# absorption, CANCEL, dialog/media lifecycle, RTCP modes, and more)
 go test ./...
 
-# Build
-go build -o bin/funsip ./cmd/funsip
+# Build the three binaries
+go build -o bin/funsip    ./cmd/funsip
 go build -o bin/funsipctl ./cmd/funsipctl
 go build -o bin/funsiptop ./cmd/funsiptop
+```
 
+## First run
+
+```bash
 # Add a subscriber
-./bin/funsipctl subscriber add alice localhost secret123
+funsipctl subscriber add alice localhost secret123
 
-# Create config (or use defaults)
-cat > funsip.json <<EOF
+# Create config (or accept defaults)
+cat > funsip.json <<'EOF'
 {
-  "listen_ip": "0.0.0.0",
+  "listen_ip":   "0.0.0.0",
   "listen_port": 5060,
-  "domain": "example.com",
-  "db_path": "funsip.db",
+  "domain":      "example.com",
+  "db_path":     "funsip.db",
   "script_path": "route.js",
-  "http_ip": "127.0.0.1",
-  "http_port": 8080
+  "http_ip":     "127.0.0.1",
+  "http_port":   8080
 }
 EOF
 
-# Copy and edit the routing script
-cp scripts/route.js route.js
-# Edit route.js — set DOMAIN to match your config
+# Edit the routing script — set DOMAIN to match your config
+${EDITOR:-vi} route.js
 
 # Start the server
-./bin/funsip -config funsip.json
+funsip -config funsip.json
 ```
 
 ## Routing Script
