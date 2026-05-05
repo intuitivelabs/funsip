@@ -48,6 +48,25 @@ func (p *Proxy) SetDialogConfirm(fn func(resp *sip.Message)) {
 	p.confirmDialog = fn
 }
 
+// ForwardOptions tunes how a single proxy forward is constructed. A
+// nil *ForwardOptions means "default": Record-Route the request with
+// loose-routing enabled. Setting RecordRoute to false suppresses the
+// Record-Route header — appropriate for stateless edge proxies that
+// do not need to stay in the signaling path of subsequent in-dialog
+// messages.
+type ForwardOptions struct {
+	RecordRoute bool
+}
+
+// recordRouteEnabled returns the effective Record-Route policy. nil
+// opts → true (default).
+func (o *ForwardOptions) recordRouteEnabled() bool {
+	if o == nil {
+		return true
+	}
+	return o.RecordRoute
+}
+
 // AnchorMedia parses the SDP body of req, allocates a relay slot per
 // media stream, and rewrites the SDP in place so that the connection
 // address and ports point to this proxy. The session is keyed by
@@ -95,7 +114,7 @@ func (p *Proxy) recordFinalDelay(req *sip.Message, statusCode int) {
 	}
 }
 
-func (p *Proxy) ForwardRequest(req *sip.Message, dst string, transport string) error {
+func (p *Proxy) ForwardRequest(req *sip.Message, dst string, transport string, opts *ForwardOptions) error {
 	if p.metrics != nil {
 		p.metrics.RecordForwarded()
 	}
@@ -121,8 +140,10 @@ func (p *Proxy) ForwardRequest(req *sip.Message, dst string, transport string) e
 	}
 	fwd.Headers.Prepend("Via", via.String())
 
-	rr := fmt.Sprintf("<sip:%s:%d;lr>", p.localIP, p.localPort)
-	fwd.Headers.Prepend("Record-Route", rr)
+	if opts.recordRouteEnabled() {
+		rr := fmt.Sprintf("<sip:%s:%d;lr>", p.localIP, p.localPort)
+		fwd.Headers.Prepend("Record-Route", rr)
+	}
 
 	p.removeProxyAuth(fwd)
 
@@ -144,7 +165,7 @@ func (p *Proxy) ForwardRequest(req *sip.Message, dst string, transport string) e
 	return err
 }
 
-func (p *Proxy) ForwardToBinding(req *sip.Message, binding *store.Binding) error {
+func (p *Proxy) ForwardToBinding(req *sip.Message, binding *store.Binding, opts *ForwardOptions) error {
 	if p.metrics != nil {
 		p.metrics.RecordForwarded()
 	}
@@ -175,8 +196,10 @@ func (p *Proxy) ForwardToBinding(req *sip.Message, binding *store.Binding) error
 	}
 	fwd.Headers.Prepend("Via", via.String())
 
-	rr := fmt.Sprintf("<sip:%s:%d;lr>", p.localIP, p.localPort)
-	fwd.Headers.Prepend("Record-Route", rr)
+	if opts.recordRouteEnabled() {
+		rr := fmt.Sprintf("<sip:%s:%d;lr>", p.localIP, p.localPort)
+		fwd.Headers.Prepend("Record-Route", rr)
+	}
 
 	p.removeProxyAuth(fwd)
 
@@ -196,7 +219,7 @@ func (p *Proxy) ForwardToBinding(req *sip.Message, binding *store.Binding) error
 // ForwardToRequestURI forwards req to the host:port encoded in its
 // Request-URI without rewriting the URI itself. This is the "send to where
 // the request says to go" mode used by proxy() with no arguments.
-func (p *Proxy) ForwardToRequestURI(req *sip.Message) error {
+func (p *Proxy) ForwardToRequestURI(req *sip.Message, opts *ForwardOptions) error {
 	if req.RequestURI == nil {
 		return fmt.Errorf("forward: no Request-URI")
 	}
@@ -231,8 +254,10 @@ func (p *Proxy) ForwardToRequestURI(req *sip.Message) error {
 	}
 	fwd.Headers.Prepend("Via", via.String())
 
-	rr := fmt.Sprintf("<sip:%s:%d;lr>", p.localIP, p.localPort)
-	fwd.Headers.Prepend("Record-Route", rr)
+	if opts.recordRouteEnabled() {
+		rr := fmt.Sprintf("<sip:%s:%d;lr>", p.localIP, p.localPort)
+		fwd.Headers.Prepend("Record-Route", rr)
+	}
 
 	p.removeProxyAuth(fwd)
 

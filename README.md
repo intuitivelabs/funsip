@@ -93,6 +93,7 @@ The routing script is JavaScript executed for each out-of-dialog or dialog-initi
 | `proxy()` | Forward to the host:port encoded in the current Request-URI. The Request-URI itself is preserved verbatim. |
 | `proxy(binding)` | Forward request to a registered contact (uses received IP:port). |
 | `proxyTo(destination, transport)` | Forward request to a fixed destination (e.g. `"10.0.0.1:5060"`). |
+| `proxy(..., {recordRoute: bool})` | All `proxy*` forms accept a trailing options object. `recordRoute` (default `true`) controls whether a `Record-Route` header with the `;lr` loose-routing parameter is added. Setting `false` suppresses Record-Route — useful for stateless edge proxies that do not need to stay in the signaling path of subsequent in-dialog requests. |
 | `log(...)` | Write to the server log. |
 
 ### Implicit SIP behaviour (NOT in the script)

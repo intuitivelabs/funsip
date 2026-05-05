@@ -1290,6 +1290,158 @@ function onRequest(req) {
 // importing the package directly via a long path.
 func sdpParse(s string) (*sdp.SDP, error) { return sdp.Parse([]byte(s)) }
 
+// ---------- proxy() options: recordRoute ----------
+
+func TestProxyRecordRouteDefaultOn(t *testing.T) {
+	h := setupHarness(t)
+
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkPort := sinkConn.LocalAddr().(*net.UDPAddr).Port
+
+	if err := h.srv.DB.SaveBinding(&store.Binding{
+		AOR:          "sip:dst@test.local",
+		Contact:      fmt.Sprintf("sip:dst@127.0.0.1:%d", sinkPort),
+		ReceivedIP:   "127.0.0.1",
+		ReceivedPort: sinkPort,
+		Transport:    "UDP",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// proxy() without an opts object — Record-Route must be present.
+	script := `
+function onRequest(req) {
+    var c = lookup();
+    if (c.length > 0) proxy(c[0]);
+    else sendResponse(404);
+}`
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy: %v", r)
+	}
+
+	msg := buildRequest("MESSAGE", "sip:dst@test.local", h.clientAddr.Port,
+		"src", "dst", "rr-default", 1,
+		[]string{"Content-Type: text/plain"}, "hi")
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(msg), target); err != nil {
+		t.Fatal(err)
+	}
+
+	sinkConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 65535)
+	n, _, err := sinkConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("sink did not receive forwarded message: %v", err)
+	}
+	fwd := string(buf[:n])
+	rr := extractHeader(fwd, "Record-Route")
+	if rr == "" {
+		t.Errorf("expected Record-Route in forwarded request:\n%s", fwd)
+	}
+	if !strings.Contains(rr, ";lr") {
+		t.Errorf("Record-Route must use loose-routing (;lr), got: %q", rr)
+	}
+}
+
+func TestProxyRecordRouteSuppressed(t *testing.T) {
+	h := setupHarness(t)
+
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkPort := sinkConn.LocalAddr().(*net.UDPAddr).Port
+
+	if err := h.srv.DB.SaveBinding(&store.Binding{
+		AOR:          "sip:dst@test.local",
+		Contact:      fmt.Sprintf("sip:dst@127.0.0.1:%d", sinkPort),
+		ReceivedIP:   "127.0.0.1",
+		ReceivedPort: sinkPort,
+		Transport:    "UDP",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	script := `
+function onRequest(req) {
+    var c = lookup();
+    if (c.length > 0) proxy(c[0], {recordRoute: false});
+    else sendResponse(404);
+}`
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy: %v", r)
+	}
+
+	msg := buildRequest("MESSAGE", "sip:dst@test.local", h.clientAddr.Port,
+		"src", "dst", "rr-off", 1, nil, "")
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(msg), target); err != nil {
+		t.Fatal(err)
+	}
+
+	sinkConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 65535)
+	n, _, err := sinkConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("sink did not receive forwarded message: %v", err)
+	}
+	fwd := string(buf[:n])
+	if rr := extractHeader(fwd, "Record-Route"); rr != "" {
+		t.Errorf("Record-Route should be suppressed by recordRoute:false, got: %q\n%s", rr, fwd)
+	}
+}
+
+func TestProxyRecordRouteExplicitTrue(t *testing.T) {
+	h := setupHarness(t)
+
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkPort := sinkConn.LocalAddr().(*net.UDPAddr).Port
+
+	// proxy() with no destination but explicit recordRoute:true.
+	// The request URI points at the sink directly.
+	script := `
+function onRequest(req) {
+    proxy({recordRoute: true});
+}`
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy: %v", r)
+	}
+
+	ruri := fmt.Sprintf("sip:dst@127.0.0.1:%d", sinkPort)
+	msg := buildRequest("MESSAGE", ruri, h.clientAddr.Port,
+		"src", "dst", "rr-true", 1, nil, "")
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(msg), target); err != nil {
+		t.Fatal(err)
+	}
+
+	sinkConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 65535)
+	n, _, err := sinkConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("sink did not receive forwarded message: %v", err)
+	}
+	fwd := string(buf[:n])
+	rr := extractHeader(fwd, "Record-Route")
+	if rr == "" {
+		t.Errorf("recordRoute:true must produce Record-Route:\n%s", fwd)
+	}
+	if !strings.Contains(rr, ";lr") {
+		t.Errorf("Record-Route must use ;lr loose-routing, got: %q", rr)
+	}
+}
+
 // ---------- RTCP signaling mode tests ----------
 
 func TestRTCPImplicitPortAllocationIsConsecutive(t *testing.T) {

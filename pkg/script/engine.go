@@ -466,35 +466,57 @@ func (e *Engine) registerFunctions(vm *goja.Runtime, req *sip.Message) {
 	})
 
 	vm.Set("proxy", func(call goja.FunctionCall) goja.Value {
-		if len(call.Arguments) == 0 {
-			if err := e.proxy.ForwardToRequestURI(req); err != nil {
-				log.Printf("[script] proxy() error: %v", err)
+		var (
+			binding   *store.Binding
+			destStr   string
+			haveDest  bool
+			transport = "UDP"
+			fwdOpts   *proxy.ForwardOptions
+		)
+
+		// Accept any of:
+		//   proxy()
+		//   proxy(opts)
+		//   proxy(binding [, opts])
+		//   proxy(destString [, transport [, opts]])
+		// — distinguishing by argument type. A map with `receivedIp`
+		// is a binding; any other map is the options object; strings
+		// fill the destination and transport slots in order.
+		for _, a := range call.Arguments {
+			switch v := a.Export().(type) {
+			case string:
+				if !haveDest {
+					destStr = v
+					haveDest = true
+				} else {
+					transport = v
+				}
+			case map[string]interface{}:
+				if v["receivedIp"] != nil {
+					binding = &store.Binding{
+						Contact:      stringField(v, "contact"),
+						ReceivedIP:   stringField(v, "receivedIp"),
+						ReceivedPort: intField(v, "receivedPort"),
+						Transport:    stringField(v, "transport"),
+					}
+				} else {
+					fwdOpts = parseForwardOpts(v)
+				}
 			}
-			return goja.Undefined()
 		}
 
-		arg := call.Argument(0)
-		obj := arg.ToObject(vm)
-
-		receivedIP := objString(obj, "receivedIp")
-		if receivedIP != "" {
-			binding := &store.Binding{
-				Contact:      objString(obj, "contact"),
-				ReceivedIP:   receivedIP,
-				ReceivedPort: int(objInt(obj, "receivedPort")),
-				Transport:    objString(obj, "transport"),
-			}
-			if err := e.proxy.ForwardToBinding(req, binding); err != nil {
+		switch {
+		case binding != nil:
+			if err := e.proxy.ForwardToBinding(req, binding, fwdOpts); err != nil {
 				log.Printf("[script] proxy to binding error: %v", err)
 			}
-		} else {
-			dst := arg.String()
-			transport := "UDP"
-			if len(call.Arguments) > 1 {
-				transport = call.Argument(1).String()
-			}
-			if err := e.proxy.ForwardRequest(req, dst, transport); err != nil {
+		case haveDest:
+			if err := e.proxy.ForwardRequest(req, destStr, transport, fwdOpts); err != nil {
 				log.Printf("[script] proxy error: %v", err)
+			}
+		default:
+			if err := e.proxy.ForwardToRequestURI(req, fwdOpts); err != nil {
+				log.Printf("[script] proxy() error: %v", err)
 			}
 		}
 		return goja.Undefined()
@@ -506,10 +528,16 @@ func (e *Engine) registerFunctions(vm *goja.Runtime, req *sip.Message) {
 		}
 		dst := call.Argument(0).String()
 		transport := "UDP"
-		if len(call.Arguments) > 1 {
-			transport = call.Argument(1).String()
+		var fwdOpts *proxy.ForwardOptions
+		for i := 1; i < len(call.Arguments); i++ {
+			switch v := call.Argument(i).Export().(type) {
+			case string:
+				transport = v
+			case map[string]interface{}:
+				fwdOpts = parseForwardOpts(v)
+			}
 		}
-		if err := e.proxy.ForwardRequest(req, dst, transport); err != nil {
+		if err := e.proxy.ForwardRequest(req, dst, transport, fwdOpts); err != nil {
 			log.Printf("[script] proxyTo error: %v", err)
 		}
 		return goja.Undefined()
@@ -539,6 +567,37 @@ func objInt(obj *goja.Object, key string) int64 {
 		return 0
 	}
 	return v.ToInteger()
+}
+
+func stringField(m map[string]interface{}, key string) string {
+	if v, ok := m[key]; ok && v != nil {
+		return fmt.Sprintf("%v", v)
+	}
+	return ""
+}
+
+func intField(m map[string]interface{}, key string) int {
+	v, ok := m[key]
+	if !ok {
+		return 0
+	}
+	switch n := v.(type) {
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case int:
+		return n
+	}
+	return 0
+}
+
+func parseForwardOpts(m map[string]interface{}) *proxy.ForwardOptions {
+	opts := &proxy.ForwardOptions{RecordRoute: true}
+	if v, ok := m["recordRoute"].(bool); ok {
+		opts.RecordRoute = v
+	}
+	return opts
 }
 
 // applyExtraHeaders adds the headers described by val to msg. val may be:
