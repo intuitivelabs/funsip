@@ -83,6 +83,7 @@ The routing script is JavaScript executed for each out-of-dialog or dialog-initi
 | `processRegister()` | Save/remove registrations and send 200 OK with current bindings. |
 | `sendResponse(code, reason)` | Send a SIP response to the current request. |
 | `sendResponse(code, reason, headers)` | Same as above, plus extra response headers. `headers` is an object `{"X-Foo": "bar", "X-List": ["a", "b"]}` or an array of `"Name: value"` strings. |
+| `anchorMedia()` / `anchorMedia({symmetric: bool})` | Anchor RTP/RTCP through this server. The SDP body of the current request is parsed and rewritten so that `c=` / `m=` / `a=rtcp` point at relay sockets allocated for this Call-ID. The answer SDP in the response is rewritten symmetrically when the response passes back through the proxy. With `symmetric:true` (default) packets are forwarded to wherever the peer is observed sending from (RTP latching, NAT-friendly); with `symmetric:false` packets are forwarded to the address advertised in the original SDP. The relay session is torn down on BYE. RTP and RTCP datagrams are not parsed — they are simply moved between sockets. |
 | `appendHeader(name, value)` | Append a header to the current request (also propagates into anything proxied afterwards). Multiple calls add multiple values. |
 | `removeHeader(name)` | Remove all instances of a header by name. Compact forms (e.g. `"v"` for `Via`, `"f"` for `From`) are accepted. |
 | `setRequestUri(uri)` | Rewrite the Request-URI. Argument is a URI string (`"sip:user@host:port"`) or a partial-update object (`{user: "...", host: "...", port: 5060}`). |
@@ -102,6 +103,7 @@ The transaction layer handles these automatically — your routing script will n
 - **CANCEL matching a pending INVITE** (RFC3261 §9.2): a 200 OK is sent for the CANCEL; CANCEL is forwarded on every INVITE branch still in `Calling` or `Proceeding` (i.e. that has not received a final response); a 487 Request Terminated is sent for the INVITE if no final response has been forwarded yet. Only orphan CANCELs (no matching INVITE) reach the routing script.
 - **Retransmissions** of any kind are absorbed by the matching transaction.
 - **Max-Forwards loop guard**: if a received request has no `Max-Forwards` header, the stack inserts `Max-Forwards: 70`. On forward, the value is decremented by one; if it would go below zero, the forward is refused with `483 Too Many Hops`.
+- **rport / received** (RFC3261 §18.2.1, RFC3581): on receive, the topmost Via header is updated in place — `received=` is added if the source IP differs from the sent-by host, and `rport=` is filled in with the actual source port if the parameter was present without a value.
 
 ### Request object properties
 

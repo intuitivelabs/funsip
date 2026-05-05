@@ -15,6 +15,8 @@ import (
 
 	"github.com/funsip/funsip/pkg/auth"
 	"github.com/funsip/funsip/pkg/config"
+	"github.com/funsip/funsip/pkg/media"
+	"github.com/funsip/funsip/pkg/sdp"
 	"github.com/funsip/funsip/pkg/server"
 	"github.com/funsip/funsip/pkg/store"
 )
@@ -988,6 +990,300 @@ function onRequest(req) {
 		t.Errorf("setRequestUri did not take effect:\n got: %q\nwant substring: %q", first, wantRURI)
 	}
 }
+
+// ---------- Media anchor tests ----------
+
+const sdpOffer = "v=0\r\n" +
+	"o=alice 1 1 IN IP4 192.0.2.10\r\n" +
+	"s=-\r\n" +
+	"c=IN IP4 192.0.2.10\r\n" +
+	"t=0 0\r\n" +
+	"m=audio 30000 RTP/AVP 0\r\n" +
+	"a=rtpmap:0 PCMU/8000\r\n" +
+	"a=sendrecv\r\n"
+
+const sdpAnswer = "v=0\r\n" +
+	"o=bob 1 1 IN IP4 192.0.2.20\r\n" +
+	"s=-\r\n" +
+	"c=IN IP4 192.0.2.20\r\n" +
+	"t=0 0\r\n" +
+	"m=audio 40000 RTP/AVP 0\r\n" +
+	"a=rtpmap:0 PCMU/8000\r\n" +
+	"a=sendrecv\r\n"
+
+func TestAnchorMediaRewritesOfferSDP(t *testing.T) {
+	h := setupHarness(t)
+
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkPort := sinkConn.LocalAddr().(*net.UDPAddr).Port
+
+	if err := h.srv.DB.SaveBinding(&store.Binding{
+		AOR:          "sip:bob@test.local",
+		Contact:      fmt.Sprintf("sip:bob@127.0.0.1:%d", sinkPort),
+		ReceivedIP:   "127.0.0.1",
+		ReceivedPort: sinkPort,
+		Transport:    "UDP",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	script := `
+function onRequest(req) {
+    if (req.method === "INVITE") {
+        anchorMedia();
+        var contacts = lookup();
+        if (contacts.length > 0) proxy(contacts[0]);
+        else sendResponse(404, "Not Found");
+        return;
+    }
+    sendResponse(405);
+}`
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy failed: %v", r)
+	}
+
+	invite := buildRequest("INVITE", "sip:bob@test.local", h.clientAddr.Port,
+		"alice", "bob", "anchor-test-1", 1,
+		[]string{
+			fmt.Sprintf("Contact: <sip:alice@127.0.0.1:%d>", h.clientAddr.Port),
+			"Content-Type: application/sdp",
+		}, sdpOffer)
+
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(invite), target); err != nil {
+		t.Fatal(err)
+	}
+
+	sinkConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 65535)
+	n, _, err := sinkConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("sink did not receive forwarded INVITE: %v", err)
+	}
+	fwd := string(buf[:n])
+
+	bodyIdx := strings.Index(fwd, "\r\n\r\n")
+	if bodyIdx < 0 {
+		t.Fatalf("no body separator in forwarded INVITE")
+	}
+	body := fwd[bodyIdx+4:]
+
+	// The c= line must be rewritten to the relay address. The o=
+	// (origin) line is left intact per RFC4566 — it just identifies
+	// the session, not where to send media.
+	if !strings.Contains(body, "c=IN IP4 127.0.0.1") {
+		t.Errorf("forwarded SDP missing relay c= line:\n%s", body)
+	}
+	// Original m=audio 30000 must be replaced with the relay port.
+	if strings.Contains(body, "m=audio 30000") {
+		t.Errorf("forwarded SDP still contains caller's original audio port 30000:\n%s", body)
+	}
+	if !strings.Contains(body, "m=audio ") {
+		t.Errorf("forwarded SDP missing m=audio line:\n%s", body)
+	}
+
+	if h.srv.Media.ActiveSessions() == 0 {
+		t.Error("no active media session after anchorMedia()")
+	}
+}
+
+func TestRTPRelaySymmetric(t *testing.T) {
+	h := setupHarness(t)
+
+	// "Alice" — receives and sends RTP from this socket
+	aliceConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer aliceConn.Close()
+	aliceAddr := aliceConn.LocalAddr().(*net.UDPAddr)
+
+	// "Bob" — analogous
+	bobConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bobConn.Close()
+	bobAddr := bobConn.LocalAddr().(*net.UDPAddr)
+
+	// Build an offer/answer pair pointing at unreachable SDP addresses
+	// so we can prove symmetric mode latches onto the source addresses
+	// from which Alice and Bob actually send.
+	offerSDP := fmt.Sprintf("v=0\r\no=alice 1 1 IN IP4 192.0.2.99\r\ns=-\r\nc=IN IP4 192.0.2.99\r\nt=0 0\r\nm=audio 20000 RTP/AVP 0\r\n")
+	answerSDP := fmt.Sprintf("v=0\r\no=bob 1 1 IN IP4 192.0.2.99\r\ns=-\r\nc=IN IP4 192.0.2.99\r\nt=0 0\r\nm=audio 20002 RTP/AVP 0\r\n")
+
+	parsedOffer, _ := sdpParse(offerSDP)
+	parsedAnswer, _ := sdpParse(answerSDP)
+
+	sess := h.srv.Media.GetOrCreate("symmetric-test", media.Options{Symmetric: true})
+	if err := sess.AnchorOffer(parsedOffer); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.AnchorAnswer(parsedAnswer); err != nil {
+		t.Fatal(err)
+	}
+
+	stream := sess.Streams[0]
+	relayAddrForBob := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: stream.ARtpPort()}
+	relayAddrForAlice := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: stream.BRtpPort()}
+
+	// Bob sends to relay's A-side port → relay should forward to Alice's
+	// observed source. Alice has not sent yet, so relay drops the first
+	// packet (symmetric mode does not use the SDP-advertised address).
+	if _, err := bobConn.WriteToUDP([]byte("from-bob-1"), relayAddrForBob); err != nil {
+		t.Fatal(err)
+	}
+	aliceConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	tmp := make([]byte, 65535)
+	if _, _, err := aliceConn.ReadFromUDP(tmp); err == nil {
+		t.Error("symmetric mode should not deliver before peer source is known")
+	}
+
+	// Alice sends; her source is now learned.
+	if _, err := aliceConn.WriteToUDP([]byte("from-alice-1"), relayAddrForAlice); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bob's NEXT packet should now be forwarded to Alice's source.
+	if _, err := bobConn.WriteToUDP([]byte("from-bob-2"), relayAddrForBob); err != nil {
+		t.Fatal(err)
+	}
+	aliceConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, src, err := aliceConn.ReadFromUDP(tmp)
+	if err != nil {
+		t.Fatalf("alice did not receive RTP: %v", err)
+	}
+	if string(tmp[:n]) != "from-bob-2" {
+		t.Errorf("unexpected payload: %q", tmp[:n])
+	}
+	_ = src
+
+	// And alice's earlier packet should have been forwarded to Bob.
+	bobConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := bobConn.ReadFromUDP(tmp); err != nil {
+		// Alice's first packet was sent before Bob had been heard from,
+		// so symmetric mode dropped it — expected. Send another.
+		if _, err := aliceConn.WriteToUDP([]byte("from-alice-2"), relayAddrForAlice); err != nil {
+			t.Fatal(err)
+		}
+		bobConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, _, err := bobConn.ReadFromUDP(tmp)
+		if err != nil {
+			t.Fatalf("bob did not receive alice's RTP: %v", err)
+		}
+		if string(tmp[:n]) != "from-alice-2" {
+			t.Errorf("unexpected payload bob received: %q", tmp[:n])
+		}
+	}
+
+	_, _ = aliceAddr, bobAddr
+}
+
+func TestRTPRelayAsymmetric(t *testing.T) {
+	h := setupHarness(t)
+
+	aliceConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer aliceConn.Close()
+	alicePort := aliceConn.LocalAddr().(*net.UDPAddr).Port
+
+	bobConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bobConn.Close()
+	bobPort := bobConn.LocalAddr().(*net.UDPAddr).Port
+
+	offerSDP := fmt.Sprintf("v=0\r\no=alice 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio %d RTP/AVP 0\r\n", alicePort)
+	answerSDP := fmt.Sprintf("v=0\r\no=bob 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio %d RTP/AVP 0\r\n", bobPort)
+
+	parsedOffer, _ := sdpParse(offerSDP)
+	parsedAnswer, _ := sdpParse(answerSDP)
+
+	sess := h.srv.Media.GetOrCreate("asymmetric-test", media.Options{Symmetric: false})
+	if err := sess.AnchorOffer(parsedOffer); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.AnchorAnswer(parsedAnswer); err != nil {
+		t.Fatal(err)
+	}
+
+	stream := sess.Streams[0]
+	relayAddrForBob := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: stream.ARtpPort()}
+
+	// Bob sends — asymmetric mode forwards to Alice's SDP-advertised
+	// address even though Alice has never sent anything.
+	someOtherSocket, err := net.DialUDP("udp4", nil, relayAddrForBob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer someOtherSocket.Close()
+	if _, err := someOtherSocket.Write([]byte("test-rtp")); err != nil {
+		t.Fatal(err)
+	}
+
+	aliceConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	tmp := make([]byte, 65535)
+	n, _, err := aliceConn.ReadFromUDP(tmp)
+	if err != nil {
+		t.Fatalf("alice did not receive RTP in asymmetric mode: %v", err)
+	}
+	if string(tmp[:n]) != "test-rtp" {
+		t.Errorf("unexpected payload: %q", tmp[:n])
+	}
+}
+
+func TestRportProcessingOnReceive(t *testing.T) {
+	h := setupHarness(t)
+
+	// Use a script that just echoes the topmost Via in a header so we
+	// can read it via the response.
+	script := `
+function onRequest(req) {
+    sendResponse(200, "OK", {"X-Echo-Via": req.getHeader("Via")});
+}`
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy failed: %v", r)
+	}
+
+	// Use a sent-by host that does NOT match the actual source IP, so
+	// "received=" must be inserted; and an empty rport, so it must be
+	// filled in with the actual source port.
+	branch := fmt.Sprintf("z9hG4bK%d-rport", time.Now().UnixNano())
+	msg := fmt.Sprintf(
+		"OPTIONS sip:test.local SIP/2.0\r\n"+
+			"Via: SIP/2.0/UDP some.where:9999;branch=%s;rport\r\n"+
+			"Max-Forwards: 70\r\n"+
+			"From: <sip:t@test.local>;tag=rt\r\n"+
+			"To: <sip:t@test.local>\r\n"+
+			"Call-ID: rport-test-1\r\n"+
+			"CSeq: 1 OPTIONS\r\n"+
+			"Content-Length: 0\r\n\r\n",
+		branch,
+	)
+
+	resp := h.sendSIP(msg)
+	via := extractHeader(resp, "X-Echo-Via")
+
+	if !strings.Contains(via, "received=127.0.0.1") {
+		t.Errorf("Via missing received=127.0.0.1: %q", via)
+	}
+	expectRportPrefix := fmt.Sprintf("rport=%d", h.clientAddr.Port)
+	if !strings.Contains(via, expectRportPrefix) {
+		t.Errorf("Via rport not filled: want substring %q, got %q", expectRportPrefix, via)
+	}
+}
+
+// sdpParse is a tiny shim so the test file can call sdp.Parse without
+// importing the package directly via a long path.
+func sdpParse(s string) (*sdp.SDP, error) { return sdp.Parse([]byte(s)) }
 
 func TestTransactionRetransmissionAbsorbed(t *testing.T) {
 	h := setupHarness(t)

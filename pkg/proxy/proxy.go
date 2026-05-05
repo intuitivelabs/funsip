@@ -2,12 +2,15 @@ package proxy
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/funsip/funsip/pkg/media"
 	"github.com/funsip/funsip/pkg/metrics"
+	"github.com/funsip/funsip/pkg/sdp"
 	"github.com/funsip/funsip/pkg/sip"
 	"github.com/funsip/funsip/pkg/store"
 	"github.com/funsip/funsip/pkg/transaction"
@@ -19,6 +22,7 @@ type Proxy struct {
 	localPort int
 	domain    string
 	metrics   *metrics.Metrics
+	media     *media.Manager
 }
 
 func New(txLayer *transaction.Layer, localIP string, localPort int, domain string, m *metrics.Metrics) *Proxy {
@@ -29,6 +33,46 @@ func New(txLayer *transaction.Layer, localIP string, localPort int, domain strin
 		domain:    domain,
 		metrics:   m,
 	}
+}
+
+func (p *Proxy) SetMediaManager(m *media.Manager) { p.media = m }
+func (p *Proxy) MediaManager() *media.Manager     { return p.media }
+
+// AnchorMedia parses the SDP body of req, allocates a relay slot per
+// media stream, and rewrites the SDP in place so that the connection
+// address and ports point to this proxy. The session is keyed by
+// Call-ID so that the answer SDP can be rewritten symmetrically when
+// the response comes back through forwardResponse.
+func (p *Proxy) AnchorMedia(req *sip.Message, opts media.Options) error {
+	if p.media == nil {
+		return fmt.Errorf("media manager not configured")
+	}
+	if len(req.Body) == 0 {
+		return nil
+	}
+
+	parsed, err := sdp.Parse(req.Body)
+	if err != nil {
+		return fmt.Errorf("parse SDP: %w", err)
+	}
+
+	sess := p.media.GetOrCreate(req.CallID(), opts)
+	if err := sess.AnchorOffer(parsed); err != nil {
+		return err
+	}
+
+	req.Body = parsed.Bytes()
+	req.Headers.Set("Content-Length", strconv.Itoa(len(req.Body)))
+	return nil
+}
+
+// CleanupMediaForCallID terminates the media session associated with
+// the given Call-ID, if any. Used on BYE.
+func (p *Proxy) CleanupMediaForCallID(callID string) {
+	if p.media == nil {
+		return
+	}
+	p.media.Delete(callID)
 }
 
 func (p *Proxy) recordFinalDelay(req *sip.Message, statusCode int) {
@@ -287,8 +331,36 @@ func (p *Proxy) forwardResponse(origReq *sip.Message, resp *sip.Message) {
 		}
 	}
 
+	p.maybeAnchorAnswer(fwd)
+
 	p.recordFinalDelay(origReq, fwd.StatusCode)
 	p.txLayer.RespondToRequest(origReq, fwd)
+}
+
+// maybeAnchorAnswer rewrites the SDP in resp if a media session is
+// active for the corresponding Call-ID. This is the offer/answer
+// completion: the offer was already anchored when the request was
+// processed, and now we install B's address/port and rewrite the
+// answer so that the original sender (A) sends RTP to our relay.
+func (p *Proxy) maybeAnchorAnswer(resp *sip.Message) {
+	if p.media == nil || len(resp.Body) == 0 {
+		return
+	}
+	sess := p.media.Get(resp.CallID())
+	if sess == nil {
+		return
+	}
+	parsed, err := sdp.Parse(resp.Body)
+	if err != nil {
+		log.Printf("[proxy] answer SDP parse error: %v", err)
+		return
+	}
+	if err := sess.AnchorAnswer(parsed); err != nil {
+		log.Printf("[proxy] anchor answer error: %v", err)
+		return
+	}
+	resp.Body = parsed.Bytes()
+	resp.Headers.Set("Content-Length", strconv.Itoa(len(resp.Body)))
 }
 
 func (p *Proxy) removeProxyAuth(msg *sip.Message) {

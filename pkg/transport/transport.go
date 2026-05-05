@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 
 	"github.com/funsip/funsip/pkg/sip"
@@ -86,6 +87,10 @@ func (m *Manager) onPacket(pkt Packet) {
 	fmt.Sscanf(port, "%d", &msg.SourcePort)
 	msg.Transport = pkt.Transport
 
+	if msg.IsRequest {
+		applyReceivedRport(msg)
+	}
+
 	m.mu.Lock()
 	if pkt.Transport == "UDP" {
 		m.stats.UDPReceived++
@@ -95,6 +100,35 @@ func (m *Manager) onPacket(pkt Packet) {
 	m.mu.Unlock()
 
 	m.handler(msg)
+}
+
+// applyReceivedRport implements RFC3261 §18.2.1 (received) and RFC3581
+// (rport) on receive: if the source IP differs from the sent-by host
+// in the topmost Via, add a received= parameter; if rport is present
+// (with empty value), set it to the actual source port.
+func applyReceivedRport(msg *sip.Message) {
+	vias := msg.Headers.GetAll("Via")
+	if len(vias) == 0 {
+		return
+	}
+	top := sip.ParseVia(vias[0])
+	if top == nil {
+		return
+	}
+
+	changed := false
+	if top.Host != msg.SourceIP {
+		top.Params["received"] = msg.SourceIP
+		changed = true
+	}
+	if val, has := top.Params["rport"]; has && val == "" {
+		top.Params["rport"] = strconv.Itoa(msg.SourcePort)
+		changed = true
+	}
+
+	if changed {
+		msg.Headers.ReplaceFirst("Via", top.String())
+	}
 }
 
 func (m *Manager) Send(msg *sip.Message, dst string, transport string) error {

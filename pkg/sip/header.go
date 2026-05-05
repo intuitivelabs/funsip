@@ -90,6 +90,18 @@ func (h *Headers) Remove(name string) {
 	}
 }
 
+// ReplaceFirst replaces the first stored value of the named header in
+// place. The header order in the message is preserved. No-op if the
+// header is absent.
+func (h *Headers) ReplaceFirst(name, value string) bool {
+	key := strings.ToLower(name)
+	if idx, ok := h.index[key]; ok && len(h.ordered[idx].values) > 0 {
+		h.ordered[idx].values[0] = value
+		return true
+	}
+	return false
+}
+
 func (h *Headers) RemoveFirst(name string) {
 	key := strings.ToLower(name)
 	if idx, ok := h.index[key]; ok {

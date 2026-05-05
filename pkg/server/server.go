@@ -8,6 +8,7 @@ import (
 	"github.com/funsip/funsip/pkg/auth"
 	"github.com/funsip/funsip/pkg/config"
 	"github.com/funsip/funsip/pkg/management"
+	"github.com/funsip/funsip/pkg/media"
 	"github.com/funsip/funsip/pkg/metrics"
 	"github.com/funsip/funsip/pkg/proxy"
 	"github.com/funsip/funsip/pkg/registrar"
@@ -29,6 +30,7 @@ type Server struct {
 	Script    *script.Engine
 	Mgmt      *management.API
 	Metrics   *metrics.Metrics
+	Media     *media.Manager
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -45,6 +47,8 @@ func New(cfg *config.Config) (*Server, error) {
 
 	s.TxLayer = transaction.NewLayer(s.Transport.Send, s.Metrics)
 	s.Proxy = proxy.New(s.TxLayer, cfg.ListenIP, cfg.ListenPort, cfg.Domain, s.Metrics)
+	s.Media = media.NewManager(cfg.ListenIP)
+	s.Proxy.SetMediaManager(s.Media)
 	s.Registrar = registrar.New(db)
 	s.Auth = auth.NewDigestAuth(db, cfg.Domain)
 
@@ -58,6 +62,12 @@ func New(cfg *config.Config) (*Server, error) {
 	s.TxLayer.SetRequestHandler(func(req *sip.Message) {
 		if req.Method == "ACK" {
 			return
+		}
+
+		if req.Method == "BYE" {
+			// Tear down any media relay for this dialog. The actual
+			// SIP forwarding happens below via the in-dialog path.
+			s.Proxy.CleanupMediaForCallID(req.CallID())
 		}
 
 		if s.Proxy.IsInDialog(req) && req.Method != "REGISTER" {

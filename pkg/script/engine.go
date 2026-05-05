@@ -9,6 +9,7 @@ import (
 
 	"github.com/dop251/goja"
 	"github.com/funsip/funsip/pkg/auth"
+	"github.com/funsip/funsip/pkg/media"
 	"github.com/funsip/funsip/pkg/proxy"
 	"github.com/funsip/funsip/pkg/registrar"
 	"github.com/funsip/funsip/pkg/sip"
@@ -314,6 +315,21 @@ func (e *Engine) registerFunctions(vm *goja.Runtime, req *sip.Message) {
 		}
 		name := sip.NormalizeHeaderName(call.Argument(0).String())
 		req.Headers.Remove(name)
+		return goja.Undefined()
+	})
+
+	vm.Set("anchorMedia", func(call goja.FunctionCall) goja.Value {
+		opts := media.DefaultOptions()
+		if len(call.Arguments) > 0 {
+			if m, ok := call.Argument(0).Export().(map[string]interface{}); ok {
+				if v, ok := m["symmetric"].(bool); ok {
+					opts.Symmetric = v
+				}
+			}
+		}
+		if err := e.proxy.AnchorMedia(req, opts); err != nil {
+			log.Printf("[script] anchorMedia error: %v", err)
+		}
 		return goja.Undefined()
 	})
 
