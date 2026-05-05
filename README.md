@@ -2,6 +2,8 @@
 
 A transaction-stateful SIP proxy and registration server with a JavaScript routing engine.
 
+Copyright © 2026 ipteles s.r.o. Licensed under the GNU General Public License v3.0 or later — see [LICENSE](LICENSE) and [COPYRIGHT](COPYRIGHT).
+
 ## Architecture
 
 ```
