@@ -37,6 +37,10 @@ A transaction-stateful SIP proxy and registration server with a JavaScript routi
 ## Quick Start
 
 ```bash
+# Run tests (integration tests cover REGISTER/auth, OPTIONS, INVITE,
+# retransmission absorption, and the management API)
+go test ./...
+
 # Build
 go build -o bin/funsip ./cmd/funsip
 go build -o bin/funsipctl ./cmd/funsipctl

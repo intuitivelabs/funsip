@@ -4,4 +4,4 @@ bin/
 *.db-wal
 *.db-shm
 funsip.json
-route.js
+/route.js
