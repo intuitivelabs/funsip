@@ -3,24 +3,27 @@ package management
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/funsip/funsip/pkg/metrics"
 	"github.com/funsip/funsip/pkg/script"
 	"github.com/funsip/funsip/pkg/store"
 	"github.com/funsip/funsip/pkg/transaction"
 	"github.com/funsip/funsip/pkg/transport"
 )
 
-const Version = "0.1.0"
+const Version = metrics.Version
 
 type API struct {
 	txLayer   *transaction.Layer
 	transport *transport.Manager
 	scriptEng *script.Engine
 	db        *store.DB
+	metrics   *metrics.Metrics
 	startTime time.Time
 	logBuf    *RingBuffer
 	server    *http.Server
@@ -31,12 +34,14 @@ func NewAPI(
 	tm *transport.Manager,
 	scriptEng *script.Engine,
 	db *store.DB,
+	m *metrics.Metrics,
 ) *API {
 	return &API{
 		txLayer:   txLayer,
 		transport: tm,
 		scriptEng: scriptEng,
 		db:        db,
+		metrics:   m,
 		startTime: time.Now(),
 		logBuf:    NewRingBuffer(1000),
 	}
@@ -49,11 +54,15 @@ func (a *API) LogBuffer() *RingBuffer {
 func (a *API) Start(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", a.handleStatus)
+	mux.HandleFunc("/metrics", a.handleMetrics)
 	mux.HandleFunc("/transactions", a.handleTransactions)
 	mux.HandleFunc("/stats", a.handleStats)
 	mux.HandleFunc("/logs", a.handleLogs)
 	mux.HandleFunc("/registrations", a.handleRegistrations)
 	mux.HandleFunc("/reload", a.handleReload)
+	mux.HandleFunc("/script", a.handleScript)
+	mux.HandleFunc("/deploy", a.handleDeploy)
+	mux.HandleFunc("/rollback", a.handleRollback)
 
 	a.server = &http.Server{
 		Addr:    addr,
@@ -83,28 +92,122 @@ func (a *API) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	txStats := a.txLayer.Stats()
 	tpStats := a.transport.GetStats()
+	goroutines, gomaxprocs, goVer := metrics.RuntimeInfo()
+	vcsRev, vcsTime := metrics.BuildInfo()
 
 	status := map[string]interface{}{
-		"version": Version,
-		"uptime":  time.Since(a.startTime).String(),
+		"version":        Version,
+		"uptime":         time.Since(a.startTime).String(),
 		"uptime_seconds": int(time.Since(a.startTime).Seconds()),
+		"build": map[string]interface{}{
+			"vcs_revision": vcsRev,
+			"vcs_time":     vcsTime,
+			"go_version":   goVer,
+		},
+		"runtime": map[string]interface{}{
+			"goroutines":  goroutines,
+			"gomaxprocs":  gomaxprocs,
+		},
 		"transactions": map[string]interface{}{
-			"total_created":    txStats.TotalCreated,
-			"active":           txStats.Active,
-			"server_count":     txStats.ServerTxCount,
-			"client_count":     txStats.ClientTxCount,
-			"avg_resp_time_ms": txStats.AvgRespTimeMs,
+			"total_created":      txStats.TotalCreated,
+			"active":             txStats.Active,
+			"server_count":       txStats.ServerTxCount,
+			"client_count":       txStats.ClientTxCount,
+			"pending_invite":     txStats.PendingINVITE,
+			"pending_non_invite": txStats.PendingNonINVITE,
+			"avg_resp_time_ms":   txStats.AvgRespTimeMs,
 		},
 		"transport": map[string]interface{}{
-			"udp_received":  tpStats.UDPReceived,
-			"udp_sent":      tpStats.UDPSent,
-			"tcp_received":  tpStats.TCPReceived,
-			"tcp_sent":      tpStats.TCPSent,
-			"parse_errors":  tpStats.ParseErrors,
+			"udp_received": tpStats.UDPReceived,
+			"udp_sent":     tpStats.UDPSent,
+			"tcp_received": tpStats.TCPReceived,
+			"tcp_sent":     tpStats.TCPSent,
+			"parse_errors": tpStats.ParseErrors,
 		},
 	}
 
+	if a.metrics != nil {
+		_, avgDelay5m := a.metrics.DelayStats(5)
+		_, avgDelay1h := a.metrics.DelayStats(60)
+		status["processing"] = map[string]interface{}{
+			"requests_received":          a.metrics.RequestsReceived.Load(),
+			"retransmissions_received":   a.metrics.Retransmissions.Load(),
+			"requests_forwarded":         a.metrics.RequestsForwarded.Load(),
+			"responses_received":         a.metrics.ResponsesReceived.Load(),
+			"requests_answered_locally":  a.metrics.RequestsAnsweredLocally.Load(),
+			"avg_delay_5m_ms":            avgDelay5m,
+			"avg_delay_1h_ms":            avgDelay1h,
+			"request_rate_5m_per_sec":    a.metrics.RequestRate(5),
+			"request_rate_1h_per_sec":    a.metrics.RequestRate(60),
+			"responses_by_class": map[string]uint64{
+				"1xx": a.metrics.Responses1xx.Load(),
+				"2xx": a.metrics.Responses2xx.Load(),
+				"3xx": a.metrics.Responses3xx.Load(),
+				"4xx": a.metrics.Responses4xx.Load(),
+				"5xx": a.metrics.Responses5xx.Load(),
+				"6xx": a.metrics.Responses6xx.Load(),
+			},
+		}
+	}
+
 	writeJSON(w, status)
+}
+
+func (a *API) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	a.handleStatus(w, r)
+}
+
+func (a *API) handleScript(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		io.WriteString(w, a.scriptEng.Source())
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (a *API) handleDeploy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+
+	if err := a.scriptEng.Deploy(string(body)); err != nil {
+		writeJSON(w, map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"success":      true,
+		"message":      "script deployed",
+		"can_rollback": a.scriptEng.HasRollback(),
+	})
+}
+
+func (a *API) handleRollback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := a.scriptEng.Rollback(); err != nil {
+		writeJSON(w, map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"success": true,
+		"message": "rolled back to previous script",
+	})
 }
 
 func (a *API) handleTransactions(w http.ResponseWriter, r *http.Request) {

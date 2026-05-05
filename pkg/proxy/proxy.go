@@ -5,7 +5,9 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/funsip/funsip/pkg/metrics"
 	"github.com/funsip/funsip/pkg/sip"
 	"github.com/funsip/funsip/pkg/store"
 	"github.com/funsip/funsip/pkg/transaction"
@@ -16,18 +18,33 @@ type Proxy struct {
 	localIP   string
 	localPort int
 	domain    string
+	metrics   *metrics.Metrics
 }
 
-func New(txLayer *transaction.Layer, localIP string, localPort int, domain string) *Proxy {
+func New(txLayer *transaction.Layer, localIP string, localPort int, domain string, m *metrics.Metrics) *Proxy {
 	return &Proxy{
 		txLayer:   txLayer,
 		localIP:   localIP,
 		localPort: localPort,
 		domain:    domain,
+		metrics:   m,
+	}
+}
+
+func (p *Proxy) recordFinalDelay(req *sip.Message, statusCode int) {
+	if p.metrics == nil || statusCode < 200 {
+		return
+	}
+	stx := p.txLayer.FindServerTx(req)
+	if stx != nil {
+		p.metrics.RecordDelay(time.Since(stx.CreatedAt()).Milliseconds())
 	}
 }
 
 func (p *Proxy) ForwardRequest(req *sip.Message, dst string, transport string) error {
+	if p.metrics != nil {
+		p.metrics.RecordForwarded()
+	}
 	fwd := req.Clone()
 
 	mf := fwd.MaxForwards()
@@ -74,6 +91,9 @@ func (p *Proxy) ForwardRequest(req *sip.Message, dst string, transport string) e
 }
 
 func (p *Proxy) ForwardToBinding(req *sip.Message, binding *store.Binding) error {
+	if p.metrics != nil {
+		p.metrics.RecordForwarded()
+	}
 	fwd := req.Clone()
 
 	mf := fwd.MaxForwards()
@@ -120,6 +140,9 @@ func (p *Proxy) ForwardToBinding(req *sip.Message, binding *store.Binding) error
 }
 
 func (p *Proxy) ForwardInDialog(req *sip.Message) error {
+	if p.metrics != nil {
+		p.metrics.RecordForwarded()
+	}
 	routes := req.Headers.GetAll("Route")
 	if len(routes) == 0 {
 		return fmt.Errorf("no Route header for in-dialog request")
@@ -206,6 +229,7 @@ func (p *Proxy) forwardResponse(origReq *sip.Message, resp *sip.Message) {
 		}
 	}
 
+	p.recordFinalDelay(origReq, fwd.StatusCode)
 	p.txLayer.RespondToRequest(origReq, fwd)
 }
 
@@ -277,11 +301,19 @@ func (p *Proxy) FixContact(req *sip.Message) {
 }
 
 func (p *Proxy) SendResponse(req *sip.Message, code int, reason string) {
+	if p.metrics != nil && code >= 200 {
+		p.metrics.RecordLocallyAnswered()
+	}
 	resp := sip.CreateResponseFromRequest(req, code, reason)
+	p.recordFinalDelay(req, code)
 	p.txLayer.RespondToRequest(req, resp)
 }
 
 func (p *Proxy) SendResponseMsg(req *sip.Message, resp *sip.Message) {
+	if p.metrics != nil && resp.StatusCode >= 200 {
+		p.metrics.RecordLocallyAnswered()
+	}
+	p.recordFinalDelay(req, resp.StatusCode)
 	p.txLayer.RespondToRequest(req, resp)
 }
 

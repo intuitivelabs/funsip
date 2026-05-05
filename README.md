@@ -44,6 +44,7 @@ go test ./...
 # Build
 go build -o bin/funsip ./cmd/funsip
 go build -o bin/funsipctl ./cmd/funsipctl
+go build -o bin/funsiptop ./cmd/funsiptop
 
 # Add a subscriber
 ./bin/funsipctl subscriber add alice localhost secret123
@@ -164,12 +165,42 @@ Use `-api url` to specify management API URL (default: `http://127.0.0.1:8080`).
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/status` | GET | Server status, uptime, version, transaction/transport stats |
+| `/status` | GET | Server status: uptime, version, build info, runtime, transaction/transport/processing stats |
+| `/metrics` | GET | Same as `/status` (alias) |
 | `/stats` | GET | Aggregate statistics |
 | `/transactions` | GET | Active transaction list with state and age |
 | `/registrations` | GET | All active registrations |
 | `/logs` | GET | Ring buffer of recent log messages (last 1000) |
-| `/reload` | POST | Hot-reload the routing script |
+| `/script` | GET | Current routing script source |
+| `/deploy` | POST | Validate, install, and activate a new routing script (request body = script source). Backs up the previous script for rollback. |
+| `/rollback` | POST | Restore the most recently deployed-over script. |
+| `/reload` | POST | Re-read routing script from disk |
+
+The `/status` endpoint returns:
+
+- `version`, `uptime`, `uptime_seconds`
+- `build`: `vcs_revision`, `vcs_time`, `go_version`
+- `runtime`: `goroutines`, `gomaxprocs`
+- `transactions`: counts by side and INVITE/non-INVITE class
+- `transport`: UDP/TCP message counters
+- `processing`: requests received / forwarded / answered locally / retransmissions; responses by class (1xx-6xx); average processing delay (5 min and 1 hour windows); request rate (5 min and 1 hour windows)
+
+## TUI: funsiptop
+
+A curses-style monitor with four tabs:
+
+```
+funsiptop -api http://127.0.0.1:8080
+```
+
+| Tab | Key | Content |
+|---|---|---|
+| Stats | `1` / `F1` | Build, uptime, runtime, transactions, transport, processing metrics |
+| Logs | `2` / `F2` | Ring buffer log messages, auto-scrolling |
+| Registrations | `3` / `F3` | Active SIP registrations table |
+| Deploy | `4` / `F4` | Edit the routing script in-place |
+
+Other keys: `q` quit, `r` refresh, `Ctrl-D` deploy script, `Ctrl-R` rollback, `Ctrl-L` reload from server.
 
 ## What the transaction layer handles automatically
 

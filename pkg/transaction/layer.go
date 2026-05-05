@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/funsip/funsip/pkg/metrics"
 	"github.com/funsip/funsip/pkg/sip"
 )
 
@@ -15,24 +16,28 @@ type Layer struct {
 	clientTxs map[string]*ClientTx
 	mu        sync.RWMutex
 	sendFunc  func(msg *sip.Message, dst string, transport string) error
+	metrics   *metrics.Metrics
 
 	onNewRequest RequestHandler
 
-	txCreated  atomic.Int64
-	txActive   atomic.Int64
+	txCreated     atomic.Int64
+	txActive      atomic.Int64
 	totalRespTime atomic.Int64
-	respCount  atomic.Int64
+	respCount     atomic.Int64
 }
 
-func NewLayer(sendFunc func(*sip.Message, string, string) error) *Layer {
+func NewLayer(sendFunc func(*sip.Message, string, string) error, m *metrics.Metrics) *Layer {
 	l := &Layer{
 		serverTxs: make(map[string]*ServerTx),
 		clientTxs: make(map[string]*ClientTx),
 		sendFunc:  sendFunc,
+		metrics:   m,
 	}
 	go l.gcLoop()
 	return l
 }
+
+func (l *Layer) Metrics() *metrics.Metrics { return l.metrics }
 
 func (l *Layer) SetRequestHandler(h RequestHandler) {
 	l.onNewRequest = h
@@ -52,6 +57,10 @@ func (l *Layer) receiveRequest(req *sip.Message) {
 		return
 	}
 
+	if l.metrics != nil {
+		l.metrics.RecordReceived()
+	}
+
 	key := MakeServerKey(req)
 	keyStr := key.String()
 
@@ -60,6 +69,9 @@ func (l *Layer) receiveRequest(req *sip.Message) {
 	l.mu.RUnlock()
 
 	if exists {
+		if l.metrics != nil {
+			l.metrics.RecordRetransmission()
+		}
 		stx.ReceiveRequest(req)
 		return
 	}
@@ -117,6 +129,10 @@ func (l *Layer) receiveResponse(resp *sip.Message) {
 	if !exists {
 		log.Printf("[tx-layer] no client tx for response %d %s (key=%s)", resp.StatusCode, resp.ReasonPhrase, keyStr)
 		return
+	}
+
+	if l.metrics != nil {
+		l.metrics.RecordResponseReceived(resp.StatusCode)
 	}
 
 	if resp.StatusCode >= 200 {
@@ -203,17 +219,35 @@ func (l *Layer) gc() {
 }
 
 type LayerStats struct {
-	TotalCreated  int64
-	Active        int64
-	ServerTxCount int
-	ClientTxCount int
-	AvgRespTimeMs int64
+	TotalCreated     int64
+	Active           int64
+	ServerTxCount    int
+	ClientTxCount    int
+	AvgRespTimeMs    int64
+	PendingINVITE    int
+	PendingNonINVITE int
 }
 
 func (l *Layer) Stats() LayerStats {
 	l.mu.RLock()
 	serverCount := len(l.serverTxs)
 	clientCount := len(l.clientTxs)
+
+	var pendingInvite, pendingNonInvite int
+	for _, tx := range l.serverTxs {
+		if tx.Type() == TypeIST {
+			pendingInvite++
+		} else {
+			pendingNonInvite++
+		}
+	}
+	for _, tx := range l.clientTxs {
+		if tx.Type() == TypeICT {
+			pendingInvite++
+		} else {
+			pendingNonInvite++
+		}
+	}
 	l.mu.RUnlock()
 
 	var avg int64
@@ -223,11 +257,13 @@ func (l *Layer) Stats() LayerStats {
 	}
 
 	return LayerStats{
-		TotalCreated:  l.txCreated.Load(),
-		Active:        l.txActive.Load(),
-		ServerTxCount: serverCount,
-		ClientTxCount: clientCount,
-		AvgRespTimeMs: avg,
+		TotalCreated:     l.txCreated.Load(),
+		Active:           l.txActive.Load(),
+		ServerTxCount:    serverCount,
+		ClientTxCount:    clientCount,
+		AvgRespTimeMs:    avg,
+		PendingINVITE:    pendingInvite,
+		PendingNonINVITE: pendingNonInvite,
 	}
 }
 

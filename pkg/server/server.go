@@ -8,6 +8,7 @@ import (
 	"github.com/funsip/funsip/pkg/auth"
 	"github.com/funsip/funsip/pkg/config"
 	"github.com/funsip/funsip/pkg/management"
+	"github.com/funsip/funsip/pkg/metrics"
 	"github.com/funsip/funsip/pkg/proxy"
 	"github.com/funsip/funsip/pkg/registrar"
 	"github.com/funsip/funsip/pkg/script"
@@ -27,6 +28,7 @@ type Server struct {
 	Auth      *auth.DigestAuth
 	Script    *script.Engine
 	Mgmt      *management.API
+	Metrics   *metrics.Metrics
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -35,14 +37,14 @@ func New(cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 
-	s := &Server{Config: cfg, DB: db}
+	s := &Server{Config: cfg, DB: db, Metrics: metrics.New()}
 
 	s.Transport = transport.NewManager(cfg.ListenIP, cfg.ListenPort, func(msg *sip.Message) {
 		s.TxLayer.ReceiveMessage(msg)
 	})
 
-	s.TxLayer = transaction.NewLayer(s.Transport.Send)
-	s.Proxy = proxy.New(s.TxLayer, cfg.ListenIP, cfg.ListenPort, cfg.Domain)
+	s.TxLayer = transaction.NewLayer(s.Transport.Send, s.Metrics)
+	s.Proxy = proxy.New(s.TxLayer, cfg.ListenIP, cfg.ListenPort, cfg.Domain, s.Metrics)
 	s.Registrar = registrar.New(db)
 	s.Auth = auth.NewDigestAuth(db, cfg.Domain)
 
@@ -72,7 +74,7 @@ func New(cfg *config.Config) (*Server, error) {
 		}
 	})
 
-	s.Mgmt = management.NewAPI(s.TxLayer, s.Transport, s.Script, db)
+	s.Mgmt = management.NewAPI(s.TxLayer, s.Transport, s.Script, db, s.Metrics)
 
 	return s, nil
 }

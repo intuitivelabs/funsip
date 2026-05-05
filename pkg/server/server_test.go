@@ -472,6 +472,119 @@ func TestManagementAPI(t *testing.T) {
 	}
 }
 
+func TestMetricsTracking(t *testing.T) {
+	h := setupHarness(t)
+	h.addSubscriber("alice", "test.local", "secret")
+
+	// Send OPTIONS (locally answered with 200)
+	msg := buildRequest("OPTIONS", "sip:test.local", h.clientAddr.Port,
+		"alice", "tester", "metrics-opt-1", 1, nil, "")
+	h.sendSIP(msg)
+
+	// Register alice (locally answered: 401 then 200)
+	registerUser(t, h, "alice", "secret", "metrics-reg", 1)
+
+	status := h.get("/status")
+	pr, ok := status["processing"].(map[string]interface{})
+	if !ok {
+		t.Fatal("processing section missing from status")
+	}
+
+	if got := getInt(pr, "requests_received"); got < 3 {
+		t.Errorf("requests_received: expected >=3 (OPTIONS + 2 REGISTERs), got %d", got)
+	}
+	if got := getInt(pr, "requests_answered_locally"); got < 3 {
+		t.Errorf("requests_answered_locally: expected >=3 (200 OPTIONS + 401 + 200 REGISTER), got %d", got)
+	}
+
+	classes, ok := pr["responses_by_class"].(map[string]interface{})
+	if !ok {
+		t.Fatal("responses_by_class section missing")
+	}
+	_ = classes // values are 0 since no upstream responses came in this test
+
+	// Verify INVITE/non-INVITE breakdown is present
+	tx := status["transactions"].(map[string]interface{})
+	if _, has := tx["pending_invite"]; !has {
+		t.Error("pending_invite missing from transactions stats")
+	}
+	if _, has := tx["pending_non_invite"]; !has {
+		t.Error("pending_non_invite missing from transactions stats")
+	}
+
+	// Verify build/runtime info is present
+	if _, has := status["build"]; !has {
+		t.Error("build info missing")
+	}
+	if _, has := status["runtime"]; !has {
+		t.Error("runtime info missing")
+	}
+}
+
+func TestDeployAndRollback(t *testing.T) {
+	h := setupHarness(t)
+
+	// Get original script
+	origText := h.getText("/script")
+	if !strings.Contains(origText, "onRequest") {
+		t.Fatalf("unexpected initial script: %q", origText)
+	}
+
+	// Deploy a new script that always returns 480
+	newScript := `function onRequest(req) { sendResponse(480, "Temporarily Unavailable"); }`
+	result := h.postText("/deploy", newScript)
+	if result["success"] != true {
+		t.Fatalf("deploy failed: %v", result)
+	}
+
+	// Send OPTIONS — should now get 480
+	msg := buildRequest("OPTIONS", "sip:test.local", h.clientAddr.Port,
+		"alice", "x", "deploy-opt-1", 1, nil, "")
+	resp := h.sendSIP(msg)
+	code, _ := parseStatusLine(resp)
+	if code != 480 {
+		t.Errorf("after deploy: expected 480, got %d", code)
+	}
+
+	// Rollback
+	rb := h.postText("/rollback", "")
+	if rb["success"] != true {
+		t.Fatalf("rollback failed: %v", rb)
+	}
+
+	// Send OPTIONS again — original script returns 200
+	msg2 := buildRequest("OPTIONS", "sip:test.local", h.clientAddr.Port,
+		"alice", "x", "deploy-opt-2", 2, nil, "")
+	resp2 := h.sendSIP(msg2)
+	code2, _ := parseStatusLine(resp2)
+	if code2 != 200 {
+		t.Errorf("after rollback: expected 200, got %d", code2)
+	}
+}
+
+func TestDeployInvalidScript(t *testing.T) {
+	h := setupHarness(t)
+
+	// Deploy a script with a syntax error
+	bad := `function onRequest(req) { this is not valid javascript ====== `
+	result := h.postText("/deploy", bad)
+	if result["success"] == true {
+		t.Fatal("expected deploy to fail for invalid script")
+	}
+	if result["error"] == nil {
+		t.Error("expected error message in response")
+	}
+
+	// Verify the original script is still active
+	msg := buildRequest("OPTIONS", "sip:test.local", h.clientAddr.Port,
+		"alice", "x", "invalid-opt", 1, nil, "")
+	resp := h.sendSIP(msg)
+	code, _ := parseStatusLine(resp)
+	if code != 200 {
+		t.Errorf("original script should still work: expected 200, got %d", code)
+	}
+}
+
 func TestTransactionRetransmissionAbsorbed(t *testing.T) {
 	h := setupHarness(t)
 
@@ -514,6 +627,48 @@ func (h *harness) getArray(path string) []interface{} {
 	var result []interface{}
 	json.NewDecoder(resp.Body).Decode(&result)
 	return result
+}
+
+func (h *harness) getText(path string) string {
+	h.t.Helper()
+	url := fmt.Sprintf("http://127.0.0.1:%d%s", h.httpPort, path)
+	resp, err := http.Get(url)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body := make([]byte, 0, 4096)
+	buf := make([]byte, 1024)
+	for {
+		n, err := resp.Body.Read(buf)
+		body = append(body, buf[:n]...)
+		if err != nil {
+			break
+		}
+	}
+	return string(body)
+}
+
+func (h *harness) postText(path, body string) map[string]interface{} {
+	h.t.Helper()
+	url := fmt.Sprintf("http://127.0.0.1:%d%s", h.httpPort, path)
+	resp, err := http.Post(url, "text/plain", strings.NewReader(body))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result
+}
+
+func getInt(m map[string]interface{}, key string) int64 {
+	if v, ok := m[key]; ok {
+		if f, ok := v.(float64); ok {
+			return int64(f)
+		}
+	}
+	return 0
 }
 
 func buildRequest(method, ruri string, viaPort int, fromUser, toUser, callID string, cseq int, extra []string, body string) string {

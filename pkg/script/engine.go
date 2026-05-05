@@ -15,10 +15,11 @@ import (
 )
 
 type Engine struct {
-	scriptPath string
-	source     string
-	prg        *goja.Program
-	mu         sync.RWMutex
+	scriptPath  string
+	source      string
+	previousSrc string
+	prg         *goja.Program
+	mu          sync.RWMutex
 
 	proxy     *proxy.Proxy
 	registrar *registrar.Registrar
@@ -69,6 +70,76 @@ func (e *Engine) Source() string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.source
+}
+
+// Validate compiles the given source without installing it. Returns the error
+// from goja.Compile if the script doesn't parse.
+func (e *Engine) Validate(source string) error {
+	_, err := goja.Compile("validate", source, true)
+	return err
+}
+
+// Deploy validates, backs up the current script, writes the new one to disk,
+// and swaps the in-memory program. Returns nil on success. If anything fails,
+// the previous script is restored on disk and in memory and an error is returned.
+func (e *Engine) Deploy(source string) error {
+	prg, err := goja.Compile(e.scriptPath, source, true)
+	if err != nil {
+		return fmt.Errorf("compile failed: %w", err)
+	}
+
+	e.mu.Lock()
+	prevSource := e.source
+	e.mu.Unlock()
+
+	if err := os.WriteFile(e.scriptPath, []byte(source), 0644); err != nil {
+		return fmt.Errorf("write script: %w", err)
+	}
+
+	e.mu.Lock()
+	e.previousSrc = prevSource
+	e.source = source
+	e.prg = prg
+	e.mu.Unlock()
+
+	log.Printf("[script] deployed new script (%d bytes)", len(source))
+	return nil
+}
+
+// Rollback reverts to the previously-installed script. Returns an error if
+// there is no previous script to roll back to.
+func (e *Engine) Rollback() error {
+	e.mu.Lock()
+	prev := e.previousSrc
+	e.mu.Unlock()
+
+	if prev == "" {
+		return fmt.Errorf("no previous script to roll back to")
+	}
+
+	prg, err := goja.Compile(e.scriptPath, prev, true)
+	if err != nil {
+		return fmt.Errorf("compile previous script: %w", err)
+	}
+
+	if err := os.WriteFile(e.scriptPath, []byte(prev), 0644); err != nil {
+		return fmt.Errorf("write script: %w", err)
+	}
+
+	e.mu.Lock()
+	e.source = prev
+	e.prg = prg
+	e.previousSrc = ""
+	e.mu.Unlock()
+
+	log.Printf("[script] rolled back to previous script (%d bytes)", len(prev))
+	return nil
+}
+
+func (e *Engine) HasRollback() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.previousSrc != ""
 }
 
 func (e *Engine) Execute(req *sip.Message) error {
