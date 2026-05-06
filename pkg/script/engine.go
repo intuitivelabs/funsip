@@ -1,6 +1,7 @@
 package script
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -18,11 +19,17 @@ import (
 	"github.com/intuitivelabs/funsip/pkg/store"
 )
 
+// ErrScriptTimeout is returned by Engine.Execute if the script ran
+// longer than the configured timeout. The server uses errors.Is to
+// detect this and answer 408 / cancel pending INVITE branches.
+var ErrScriptTimeout = errors.New("script execution timed out")
+
 type Engine struct {
 	scriptPath  string
 	source      string
 	previousSrc string
 	prg         *goja.Program
+	timeout     time.Duration
 	mu          sync.RWMutex
 
 	proxy     *proxy.Proxy
@@ -33,6 +40,15 @@ type Engine struct {
 }
 
 func (e *Engine) SetDialogManager(m *dialog.Manager) { e.dialogs = m }
+
+// SetTimeout sets the maximum wall-clock time a single script
+// execution may run for. A non-positive value falls back to a 3 s
+// default. Set once at startup.
+func (e *Engine) SetTimeout(d time.Duration) {
+	e.mu.Lock()
+	e.timeout = d
+	e.mu.Unlock()
+}
 
 func NewEngine(scriptPath string, p *proxy.Proxy, r *registrar.Registrar, a *auth.DigestAuth, db *store.DB) (*Engine, error) {
 	e := &Engine{
@@ -152,18 +168,32 @@ func (e *Engine) HasRollback() bool {
 func (e *Engine) Execute(req *sip.Message) error {
 	e.mu.RLock()
 	prg := e.prg
+	timeout := e.timeout
 	e.mu.RUnlock()
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
 
 	vm := goja.New()
 
 	reqObj := e.buildRequestObject(vm, req)
-
 	vm.Set("req", reqObj)
-
 	e.registerFunctions(vm, req)
 
-	_, err := vm.RunProgram(prg)
-	if err != nil {
+	// Watchdog: vm.Interrupt is safe to call from another goroutine
+	// and causes the next bytecode instruction to throw the supplied
+	// reason. Goja wraps that into an *InterruptedError which we map
+	// to ErrScriptTimeout. Native callbacks (proxy, sendResponse,
+	// etc.) are not interruptible mid-call — the interrupt only
+	// fires when control returns to the JS bytecode loop. That is
+	// good enough: the script has to be in JS to keep running.
+	timer := time.AfterFunc(timeout, func() { vm.Interrupt(ErrScriptTimeout) })
+	defer timer.Stop()
+
+	if _, err := vm.RunProgram(prg); err != nil {
+		if isInterrupt(err) {
+			return ErrScriptTimeout
+		}
 		return fmt.Errorf("run script: %w", err)
 	}
 
@@ -172,12 +202,22 @@ func (e *Engine) Execute(req *sip.Message) error {
 		return fmt.Errorf("onRequest function not found in script")
 	}
 
-	_, err = onRequest(goja.Undefined(), reqObj)
-	if err != nil {
+	if _, err := onRequest(goja.Undefined(), reqObj); err != nil {
+		if isInterrupt(err) {
+			return ErrScriptTimeout
+		}
 		return fmt.Errorf("onRequest: %w", err)
 	}
 
 	return nil
+}
+
+// isInterrupt reports whether err is the goja interrupt the
+// watchdog timer triggered above. Any *goja.InterruptedError is
+// treated as a script timeout.
+func isInterrupt(err error) bool {
+	var ie *goja.InterruptedError
+	return errors.As(err, &ie)
 }
 
 func (e *Engine) buildRequestObject(vm *goja.Runtime, req *sip.Message) goja.Value {

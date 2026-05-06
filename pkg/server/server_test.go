@@ -1296,6 +1296,198 @@ function onRequest(req) {
 // importing the package directly via a long path.
 func sdpParse(s string) (*sdp.SDP, error) { return sdp.Parse([]byte(s)) }
 
+// ---------- Script & INVITE-transaction timeouts ----------
+
+func TestScriptTimeoutNonInvite(t *testing.T) {
+	h := setupHarness(t)
+	h.srv.Script.SetTimeout(150 * time.Millisecond)
+
+	// Infinite loop in JS — the watchdog must abort it.
+	if r := h.postText("/deploy", `function onRequest(req){ while(true){} }`); r["success"] != true {
+		t.Fatalf("deploy: %v", r)
+	}
+
+	msg := buildRequest("OPTIONS", "sip:test.local", h.clientAddr.Port,
+		"alice", "tester", "script-timeout-opt", 1, nil, "")
+	resp := h.sendSIPFinal(msg)
+	code, _ := parseStatusLine(resp)
+	if code != 408 {
+		t.Errorf("script-timeout OPTIONS: want 408, got %d\n%s", code, resp)
+	}
+}
+
+func TestScriptTimeoutInviteCancelsBranches(t *testing.T) {
+	h := setupHarness(t)
+	h.srv.Script.SetTimeout(200 * time.Millisecond)
+
+	// Sink that swallows everything but counts received methods.
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkPort := sinkConn.LocalAddr().(*net.UDPAddr).Port
+	if err := h.srv.DB.SaveBinding(&store.Binding{
+		AOR:          "sip:bob@test.local",
+		Contact:      fmt.Sprintf("sip:bob@127.0.0.1:%d", sinkPort),
+		ReceivedIP:   "127.0.0.1",
+		ReceivedPort: sinkPort,
+		Transport:    "UDP",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Forward first, THEN spin — so the watchdog catches the loop
+	// after a real client transaction has been created upstream.
+	if r := h.postText("/deploy", `function onRequest(req){
+        var c = lookup();
+        if (c.length > 0) proxy(c[0]);
+        while(true){}
+    }`); r["success"] != true {
+		t.Fatalf("deploy: %v", r)
+	}
+
+	invite := buildRequest("INVITE", "sip:bob@test.local", h.clientAddr.Port,
+		"alice", "bob", "script-timeout-invite", 1,
+		[]string{fmt.Sprintf("Contact: <sip:alice@127.0.0.1:%d>", h.clientAddr.Port)}, "")
+
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(invite), target); err != nil {
+		t.Fatal(err)
+	}
+
+	// Drain whatever arrives at the sink — first the forwarded INVITE,
+	// then (after the script is interrupted) the proxy-generated CANCEL.
+	var sawInvite, sawCancel bool
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !(sawInvite && sawCancel) {
+		sinkConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		buf := make([]byte, 65535)
+		n, _, err := sinkConn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		first := strings.SplitN(string(buf[:n]), "\r\n", 2)[0]
+		switch {
+		case strings.HasPrefix(first, "INVITE "):
+			sawInvite = true
+		case strings.HasPrefix(first, "CANCEL "):
+			sawCancel = true
+		}
+	}
+	if !sawInvite {
+		t.Error("sink did not receive forwarded INVITE")
+	}
+	if !sawCancel {
+		t.Error("sink did not receive CANCEL after script timeout")
+	}
+
+	// UAC must receive 408 (after the auto-100 Trying).
+	got408 := false
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !got408 {
+		h.clientConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		buf := make([]byte, 65535)
+		n, _, err := h.clientConn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		code, _ := parseStatusLine(string(buf[:n]))
+		if code == 408 {
+			got408 = true
+		}
+	}
+	if !got408 {
+		t.Error("UAC did not receive 408 after script timeout")
+	}
+}
+
+func TestInviteTransactionTimeoutCancelsBranches(t *testing.T) {
+	h := setupHarness(t)
+	// Short INVITE-transaction timeout for the test.
+	h.srv.TxLayer.SetInviteTimeout(400 * time.Millisecond)
+
+	// Sink that ACCEPTS but never replies — this is the "stuck
+	// upstream" case the cap is meant to handle.
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkPort := sinkConn.LocalAddr().(*net.UDPAddr).Port
+
+	if err := h.srv.DB.SaveBinding(&store.Binding{
+		AOR:          "sip:bob@test.local",
+		Contact:      fmt.Sprintf("sip:bob@127.0.0.1:%d", sinkPort),
+		ReceivedIP:   "127.0.0.1",
+		ReceivedPort: sinkPort,
+		Transport:    "UDP",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if r := h.postText("/deploy", `function onRequest(req){
+        var c = lookup();
+        if (c.length > 0) proxy(c[0]); else sendResponse(404);
+    }`); r["success"] != true {
+		t.Fatalf("deploy: %v", r)
+	}
+
+	invite := buildRequest("INVITE", "sip:bob@test.local", h.clientAddr.Port,
+		"alice", "bob", "tx-timeout-invite", 1,
+		[]string{fmt.Sprintf("Contact: <sip:alice@127.0.0.1:%d>", h.clientAddr.Port)}, "")
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(invite), target); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sink should receive INVITE, then (after timeout) a CANCEL.
+	var sawInvite, sawCancel bool
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !(sawInvite && sawCancel) {
+		sinkConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		buf := make([]byte, 65535)
+		n, _, err := sinkConn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		first := strings.SplitN(string(buf[:n]), "\r\n", 2)[0]
+		switch {
+		case strings.HasPrefix(first, "INVITE "):
+			sawInvite = true
+		case strings.HasPrefix(first, "CANCEL "):
+			sawCancel = true
+		}
+	}
+	if !sawInvite {
+		t.Error("sink did not receive forwarded INVITE")
+	}
+	if !sawCancel {
+		t.Error("sink did not receive CANCEL after invite-transaction timeout")
+	}
+
+	// UAC must receive 408.
+	got408 := false
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !got408 {
+		h.clientConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		buf := make([]byte, 65535)
+		n, _, err := h.clientConn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		code, _ := parseStatusLine(string(buf[:n]))
+		if code == 408 {
+			got408 = true
+		}
+	}
+	if !got408 {
+		t.Error("UAC did not receive 408 after invite-transaction timeout")
+	}
+}
+
 // ---------- RTP analyzer (PCAP + WAV + DTMF + QoS) ----------
 
 // rtpPacket builds a minimal RTPv2 packet (12-byte header + payload)

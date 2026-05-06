@@ -1,9 +1,11 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"time"
 
 	"github.com/intuitivelabs/funsip/pkg/auth"
 	"github.com/intuitivelabs/funsip/pkg/config"
@@ -80,6 +82,12 @@ func New(cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("load script: %w", err)
 	}
 	eng.SetDialogManager(s.Dialogs)
+	if cfg.ScriptTimeoutMs > 0 {
+		eng.SetTimeout(time.Duration(cfg.ScriptTimeoutMs) * time.Millisecond)
+	}
+	if cfg.InviteTimeoutMs > 0 {
+		s.TxLayer.SetInviteTimeout(time.Duration(cfg.InviteTimeoutMs) * time.Millisecond)
+	}
 	s.Script = eng
 
 	s.TxLayer.SetRequestHandler(func(req *sip.Message) {
@@ -117,6 +125,14 @@ func New(cfg *config.Config) (*Server, error) {
 		}
 
 		if err := eng.Execute(req); err != nil {
+			if errors.Is(err, script.ErrScriptTimeout) {
+				log.Printf("[server] script timeout for %s — 408 + cancel any pending branches", req.Method)
+				if req.Method == "INVITE" {
+					s.TxLayer.CancelPendingBranches(req)
+				}
+				s.Proxy.SendResponse(req, 408, "Request Timeout")
+				return
+			}
 			log.Printf("[server] script error: %v", err)
 			s.Proxy.SendResponse(req, 500, "Server Internal Error")
 		}

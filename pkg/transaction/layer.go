@@ -15,11 +15,14 @@ type Layer struct {
 	serverTxs       map[string]*ServerTx
 	clientTxs       map[string]*ClientTx
 	serverToClients map[string][]string
+	inviteTimers    map[string]*time.Timer
 	mu              sync.RWMutex
 	sendFunc        func(msg *sip.Message, dst string, transport string) error
 	metrics         *metrics.Metrics
 
 	onNewRequest RequestHandler
+
+	inviteTimeout time.Duration
 
 	txCreated     atomic.Int64
 	txActive      atomic.Int64
@@ -27,13 +30,23 @@ type Layer struct {
 	respCount     atomic.Int64
 }
 
+// SetInviteTimeout configures the per-INVITE-server-transaction wall
+// clock cap. A non-positive value disables the timer and INVITE
+// transactions are bound only by RFC3261's state-machine timers.
+// Default 3 minutes if not set explicitly.
+func (l *Layer) SetInviteTimeout(d time.Duration) {
+	l.inviteTimeout = d
+}
+
 func NewLayer(sendFunc func(*sip.Message, string, string) error, m *metrics.Metrics) *Layer {
 	l := &Layer{
 		serverTxs:       make(map[string]*ServerTx),
 		clientTxs:       make(map[string]*ClientTx),
 		serverToClients: make(map[string][]string),
+		inviteTimers:    make(map[string]*time.Timer),
 		sendFunc:        sendFunc,
 		metrics:         m,
+		inviteTimeout:   3 * time.Minute,
 	}
 	go l.gcLoop()
 	return l
@@ -109,8 +122,21 @@ func (l *Layer) receiveRequest(req *sip.Message) {
 	l.txCreated.Add(1)
 	l.txActive.Add(1)
 
+	// INVITE transactions get an additional wall-clock cap. RFC3261's
+	// IST state-machine timers terminate the transaction only after a
+	// final response is sent — but a UAS that is forever stuck in
+	// Proceeding (no response from upstream) would otherwise live
+	// indefinitely. The user-configured InviteTimeout terminates the
+	// stalled transaction by 408-ing the UAC and CANCELling pending
+	// branches.
+	if req.Method == "INVITE" && l.inviteTimeout > 0 {
+		stx := tx
+		l.armInviteTimeout(keyStr, stx)
+	}
+
 	go func() {
 		<-tx.Done()
+		l.cancelInviteTimer(keyStr)
 		l.txActive.Add(-1)
 	}()
 
@@ -239,16 +265,34 @@ func (l *Layer) handleCancelMatched(cancel *sip.Message, inviteSrv *ServerTx, in
 	ok := sip.CreateResponseFromRequest(cancel, 200, "OK")
 	cancelTx.Respond(ok)
 
+	l.cancelPendingBranchesForServerKey(inviteKey)
+
+	if inviteSrv.State() == StateProceeding {
+		terminated := sip.CreateResponseFromRequest(inviteSrv.Request(), 487, "Request Terminated")
+		inviteSrv.Respond(terminated)
+	}
+}
+
+// CancelPendingBranches sends CANCEL on every INVITE client
+// transaction this proxy has created on behalf of originReq's
+// server transaction, that is still in Calling or Proceeding state.
+// Used by the server's script-timeout handler to abort upstream
+// branches before answering 408 to the UAC.
+func (l *Layer) CancelPendingBranches(originReq *sip.Message) {
+	srvKey := MakeServerKey(originReq).String()
+	l.cancelPendingBranchesForServerKey(srvKey)
+}
+
+func (l *Layer) cancelPendingBranchesForServerKey(srvKey string) {
 	l.mu.RLock()
-	clientKeys := append([]string(nil), l.serverToClients[inviteKey]...)
-	clients := make([]*ClientTx, 0, len(clientKeys))
-	for _, k := range clientKeys {
-		if c, found := l.clientTxs[k]; found {
+	keys := append([]string(nil), l.serverToClients[srvKey]...)
+	clients := make([]*ClientTx, 0, len(keys))
+	for _, k := range keys {
+		if c, ok := l.clientTxs[k]; ok {
 			clients = append(clients, c)
 		}
 	}
 	l.mu.RUnlock()
-
 	for _, ct := range clients {
 		if ct.Type() != TypeICT {
 			continue
@@ -259,11 +303,34 @@ func (l *Layer) handleCancelMatched(cancel *sip.Message, inviteSrv *ServerTx, in
 		}
 		l.sendCancelForBranch(ct)
 	}
+}
 
-	if inviteSrv.State() == StateProceeding {
-		terminated := sip.CreateResponseFromRequest(inviteSrv.Request(), 487, "Request Terminated")
-		inviteSrv.Respond(terminated)
+// armInviteTimeout starts a single-shot timer that fires after
+// l.inviteTimeout and, if the IST is still pending, sends 408 to
+// the UAC and CANCEL to every upstream branch.
+func (l *Layer) armInviteTimeout(srvKey string, tx *ServerTx) {
+	timer := time.AfterFunc(l.inviteTimeout, func() {
+		state := tx.State()
+		if state != StateProceeding {
+			return // already terminated/completed naturally
+		}
+		log.Printf("[tx-layer] INVITE %s timed out after %v — 408 + CANCEL upstream", srvKey, l.inviteTimeout)
+		l.cancelPendingBranchesForServerKey(srvKey)
+		resp := sip.CreateResponseFromRequest(tx.Request(), 408, "Request Timeout")
+		tx.Respond(resp)
+	})
+	l.mu.Lock()
+	l.inviteTimers[srvKey] = timer
+	l.mu.Unlock()
+}
+
+func (l *Layer) cancelInviteTimer(srvKey string) {
+	l.mu.Lock()
+	if t, ok := l.inviteTimers[srvKey]; ok {
+		t.Stop()
+		delete(l.inviteTimers, srvKey)
 	}
+	l.mu.Unlock()
 }
 
 // sendCancelForBranch constructs and sends a CANCEL request matching the

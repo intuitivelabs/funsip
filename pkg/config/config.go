@@ -20,19 +20,31 @@ type Config struct {
 	// call-end, reg-new, reg-del, reg-expired). Empty disables event
 	// emission.
 	EventsURL string `json:"events_url"`
+	// ScriptTimeoutMs is the maximum wall-clock time the routing
+	// script is allowed to run for one request, in milliseconds. On
+	// timeout the transaction is answered with 408 and any pending
+	// INVITE branches are cancelled. Default 3000.
+	ScriptTimeoutMs int `json:"script_timeout_ms"`
+	// InviteTimeoutMs is a hard cap on INVITE server transactions
+	// that have not yet sent a final response, in milliseconds. On
+	// expiry the UAC is answered with 408 and CANCEL is fanned out
+	// to all pending upstream branches. Default 180000 (3 min).
+	InviteTimeoutMs int `json:"invite_timeout_ms"`
 }
 
 func DefaultConfig() *Config {
 	return &Config{
-		ListenIP:   "0.0.0.0",
-		ListenPort: 5060,
-		Domain:     "localhost",
-		DBPath:     "funsip.db",
-		ScriptPath: "route.js",
-		HTTPIP:     "127.0.0.1",
-		HTTPPort:   8080,
-		LogLevel:   "info",
-		PCAPDir:    ".",
+		ListenIP:        "0.0.0.0",
+		ListenPort:      5060,
+		Domain:          "localhost",
+		DBPath:          "funsip.db",
+		ScriptPath:      "route.js",
+		HTTPIP:          "127.0.0.1",
+		HTTPPort:        8080,
+		LogLevel:        "info",
+		PCAPDir:         ".",
+		ScriptTimeoutMs: 3000,
+		InviteTimeoutMs: 180000,
 	}
 }
 
