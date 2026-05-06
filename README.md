@@ -133,6 +133,35 @@ The transaction layer handles these automatically — your routing script will n
 - **Max-Forwards loop guard**: if a received request has no `Max-Forwards` header, the stack inserts `Max-Forwards: 70`. On forward, the value is decremented by one; if it would go below zero, the forward is refused with `483 Too Many Hops`.
 - **rport / received** (RFC3261 §18.2.1, RFC3581): on receive, the topmost Via header is updated in place — `received=` is added if the source IP differs from the sent-by host, and `rport=` is filled in with the actual source port if the parameter was present without a value.
 - **TCP connection reuse**: every accepted and every dialed TCP connection is kept open, registered in an alias table keyed by peer `host:port`, and reused for subsequent sends. SO_KEEPALIVE is enabled. If a cached connection's write fails (peer reset, half-close, network drop), the entry is removed and the send transparently re-dials a fresh connection. Concurrent sends to the same destination are serialized through a per-destination lock so only one socket is ever opened. The current alias-table size is reported as `transport.tcp_connections` in `/status`.
+
+## Events
+
+When `events_url` is configured (e.g. `"events_url": "http://collector.example.com/_bulk"` in `funsip.json`), the stack POSTs one JSON event per situation to that URL. Emission is fully asynchronous — events are dropped onto a bounded channel and a single worker goroutine drains it; if the channel overflows the event is dropped and a counter is bumped. The SIP / RTP hot path never blocks on disk or network I/O.
+
+| `type2` | When |
+|---|---|
+| `auth-failed` | A SIP transaction completed with a final `401` or `407` response |
+| `call-attempt` | An INVITE transaction completed with a final response `>=300` (other than `401`/`407`) |
+| `call-start` | An INVITE transaction completed with a final `2xx` response |
+| `call-end` | A tracked dialog ended via BYE (`originator: caller-terminated`/`callee-terminated`) or timed out (`originator: timeout`) |
+| `reg-new` | A REGISTER stored a new (or refreshed) binding |
+| `reg-del` | A REGISTER with `Expires: 0` (or `Contact: *`) removed a binding |
+| `reg-expired` | The registrar's expiry sweeper removed a binding whose `expires_at` had elapsed |
+
+Each event has the shape
+
+```json
+{
+  "@timestamp": "2026-05-06T12:34:56.789Z",
+  "type": "event",
+  "type2": "call-start",
+  "attrs": { "type": "call-start", "method": "INVITE", "call-id": "...", "from": "...", "to": "...", "r-uri": "...", "source": "1.2.3.4", "src-port": 54321, "transport": "udp", "sip-code": 200, "reason": "OK", ... },
+  "client": { "ip": "1.2.3.4", "port": 54321, "transport": "udp" },
+  "sip": { "call_id": "...", "from": "...", "fromtag": "...", "to": "...", "totag": "...", "request": { "method": "INVITE" }, "response": { "status": 200 }, "sip_reason": "OK" }
+}
+```
+
+`call-end` additionally carries `attrs.duration` (seconds), `event.duration`, and `sip.originator`.
 - **Dialog cleanup on BYE**: if the script enabled dialog tracking via `setupDialog`, an in-dialog BYE matching a known dialog tears down the dialog state (cancels the timeout timer, closes the per-dialog PCAP file) before the BYE is forwarded.
 - **Dialog timeout B2BUA**: if no BYE arrives within the configured timeout (default 61 min), the stack sends a BYE to each side of the call (Caller→Callee and Callee→Caller, each with its own From/To and a CSeq high enough to outrank in-dialog use), increments the `dialogs.timed_out` counter, and removes the dialog state.
 

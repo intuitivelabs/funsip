@@ -15,6 +15,11 @@ type Config struct {
 	HTTPPort   int    `json:"http_port"`
 	LogLevel   string `json:"log_level"`
 	PCAPDir    string `json:"pcap_dir"`
+	// EventsURL is an optional HTTP endpoint that receives one POST
+	// per emitted event (auth-failed, call-attempt, call-start,
+	// call-end, reg-new, reg-del, reg-expired). Empty disables event
+	// emission.
+	EventsURL string `json:"events_url"`
 }
 
 func DefaultConfig() *Config {

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/intuitivelabs/funsip/pkg/events"
 	"github.com/intuitivelabs/funsip/pkg/media"
 	"github.com/intuitivelabs/funsip/pkg/metrics"
 	"github.com/intuitivelabs/funsip/pkg/sdp"
@@ -23,9 +24,12 @@ type Proxy struct {
 	domain    string
 	metrics   *metrics.Metrics
 	media     *media.Manager
+	events    *events.Sink
 
 	confirmDialog func(resp *sip.Message)
 }
+
+func (p *Proxy) SetEventSink(s *events.Sink) { p.events = s }
 
 func New(txLayer *transaction.Layer, localIP string, localPort int, domain string, m *metrics.Metrics) *Proxy {
 	return &Proxy{
@@ -102,6 +106,26 @@ func (p *Proxy) CleanupMediaForCallID(callID string) {
 		return
 	}
 	p.media.Delete(callID)
+}
+
+// emitResponseEvent emits an event for a final SIP response sent on
+// behalf of req. Provisional responses (<200) are ignored.
+//   - 401 / 407 → auth-failed
+//   - INVITE 2xx → call-start
+//   - INVITE 3xx-6xx (excluding 401/407) → call-attempt
+// Other final responses produce no event.
+func (p *Proxy) emitResponseEvent(req *sip.Message, statusCode int, reason string) {
+	if p.events == nil || statusCode < 200 {
+		return
+	}
+	switch {
+	case statusCode == 401 || statusCode == 407:
+		p.events.Send(events.FromRequest("auth-failed", req).WithResponse(statusCode, reason))
+	case req.Method == "INVITE" && statusCode >= 200 && statusCode < 300:
+		p.events.Send(events.FromRequest("call-start", req).WithResponse(statusCode, reason))
+	case req.Method == "INVITE" && statusCode >= 300:
+		p.events.Send(events.FromRequest("call-attempt", req).WithResponse(statusCode, reason))
+	}
 }
 
 func (p *Proxy) recordFinalDelay(req *sip.Message, statusCode int) {
@@ -373,6 +397,7 @@ func (p *Proxy) forwardResponse(origReq *sip.Message, resp *sip.Message) {
 	}
 
 	p.recordFinalDelay(origReq, fwd.StatusCode)
+	p.emitResponseEvent(origReq, fwd.StatusCode, fwd.ReasonPhrase)
 	p.txLayer.RespondToRequest(origReq, fwd)
 }
 
@@ -475,6 +500,7 @@ func (p *Proxy) SendResponse(req *sip.Message, code int, reason string) {
 	}
 	resp := sip.CreateResponseFromRequest(req, code, reason)
 	p.recordFinalDelay(req, code)
+	p.emitResponseEvent(req, code, reason)
 	p.txLayer.RespondToRequest(req, resp)
 }
 
@@ -483,6 +509,7 @@ func (p *Proxy) SendResponseMsg(req *sip.Message, resp *sip.Message) {
 		p.metrics.RecordLocallyAnswered()
 	}
 	p.recordFinalDelay(req, resp.StatusCode)
+	p.emitResponseEvent(req, resp.StatusCode, resp.ReasonPhrase)
 	p.txLayer.RespondToRequest(req, resp)
 }
 

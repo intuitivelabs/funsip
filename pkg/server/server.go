@@ -8,6 +8,7 @@ import (
 	"github.com/intuitivelabs/funsip/pkg/auth"
 	"github.com/intuitivelabs/funsip/pkg/config"
 	"github.com/intuitivelabs/funsip/pkg/dialog"
+	"github.com/intuitivelabs/funsip/pkg/events"
 	"github.com/intuitivelabs/funsip/pkg/management"
 	"github.com/intuitivelabs/funsip/pkg/media"
 	"github.com/intuitivelabs/funsip/pkg/metrics"
@@ -33,6 +34,7 @@ type Server struct {
 	Metrics   *metrics.Metrics
 	Media     *media.Manager
 	Dialogs   *dialog.Manager
+	Events    *events.Sink
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -54,6 +56,11 @@ func New(cfg *config.Config) (*Server, error) {
 	s.Registrar = registrar.New(db)
 	s.Auth = auth.NewDigestAuth(db, cfg.Domain)
 	s.Dialogs = dialog.NewManager(s.Transport, s.Metrics, cfg.ListenIP, cfg.ListenPort, cfg.PCAPDir)
+	s.Events = events.NewSink(cfg.EventsURL)
+
+	s.Proxy.SetEventSink(s.Events)
+	s.Registrar.SetEventSink(s.Events)
+	s.Dialogs.SetEventSink(s.Events)
 
 	s.Proxy.SetDialogConfirm(s.Dialogs.ConfirmFromResponse)
 	s.Dialogs.SetMediaCleanup(s.Proxy.CleanupMediaForCallID)
@@ -79,7 +86,7 @@ func New(cfg *config.Config) (*Server, error) {
 
 			if req.Method == "BYE" {
 				if d != nil {
-					s.Dialogs.Terminate(req.CallID())
+					s.Dialogs.Terminate(req.CallID(), req)
 				}
 				s.Proxy.CleanupMediaForCallID(req.CallID())
 				if err := s.Proxy.ForwardInDialog(req); err != nil {
@@ -142,6 +149,12 @@ func (s *Server) Stop() {
 	}
 	if s.Dialogs != nil {
 		s.Dialogs.CloseAll()
+	}
+	if s.Registrar != nil {
+		s.Registrar.Stop()
+	}
+	if s.Events != nil {
+		s.Events.Close()
 	}
 	if s.Transport != nil {
 		s.Transport.Stop()

@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 	"github.com/intuitivelabs/funsip/pkg/auth"
 	"github.com/intuitivelabs/funsip/pkg/config"
 	"github.com/intuitivelabs/funsip/pkg/dialog"
+	"github.com/intuitivelabs/funsip/pkg/events"
 	"github.com/intuitivelabs/funsip/pkg/media"
 	"github.com/intuitivelabs/funsip/pkg/sdp"
 	"github.com/intuitivelabs/funsip/pkg/server"
@@ -1293,6 +1295,306 @@ function onRequest(req) {
 // sdpParse is a tiny shim so the test file can call sdp.Parse without
 // importing the package directly via a long path.
 func sdpParse(s string) (*sdp.SDP, error) { return sdp.Parse([]byte(s)) }
+
+// ---------- Event emission ----------
+
+// attachEventCollector replaces the harness's events sink with one
+// that POSTs to a local httptest.Server. Returned channel receives
+// every event the proxy/registrar/dialog manager emits while the
+// test is running.
+func attachEventCollector(t *testing.T, h *harness) <-chan *events.Event {
+	t.Helper()
+	ch := make(chan *events.Event, 32)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var ev events.Event
+		if err := json.Unmarshal(body, &ev); err == nil {
+			select {
+			case ch <- &ev:
+			default:
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	if h.srv.Events != nil {
+		h.srv.Events.Close()
+	}
+	sink := events.NewSink(srv.URL)
+	t.Cleanup(sink.Close)
+	h.srv.Events = sink
+	h.srv.Proxy.SetEventSink(sink)
+	h.srv.Registrar.SetEventSink(sink)
+	h.srv.Dialogs.SetEventSink(sink)
+	return ch
+}
+
+// waitForEvent reads from ch until an event with type2 == want is
+// seen or the deadline elapses. Other types in flight are silently
+// drained.
+func waitForEvent(t *testing.T, ch <-chan *events.Event, want string, timeout time.Duration) *events.Event {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case ev := <-ch:
+			if ev.Type2 == want {
+				return ev
+			}
+		case <-timer.C:
+			t.Fatalf("did not receive %q event within %v", want, timeout)
+			return nil
+		}
+	}
+}
+
+func TestEventAuthFailed(t *testing.T) {
+	h := setupHarness(t)
+	h.addSubscriber("alice", "test.local", "secret")
+	evCh := attachEventCollector(t, h)
+
+	// REGISTER without credentials — server replies 401 — event fires.
+	msg := buildRequest("REGISTER", "sip:test.local", h.clientAddr.Port,
+		"alice", "alice", "ev-authfail-1", 1,
+		[]string{"Contact: <sip:alice@127.0.0.1:9999>", "Expires: 3600"}, "")
+	resp := h.sendSIP(msg)
+	if code, _ := parseStatusLine(resp); code != 401 {
+		t.Fatalf("want 401, got %d", code)
+	}
+
+	ev := waitForEvent(t, evCh, "auth-failed", 2*time.Second)
+	if ev.Attrs["sip-code"] != float64(401) {
+		t.Errorf("auth-failed event sip-code: want 401, got %v", ev.Attrs["sip-code"])
+	}
+	if ev.Attrs["method"] != "REGISTER" {
+		t.Errorf("auth-failed event method: want REGISTER, got %v", ev.Attrs["method"])
+	}
+	if ev.SIP == nil || ev.SIP.Response == nil || ev.SIP.Response.Status != 401 {
+		t.Errorf("auth-failed sip.response.status: %#v", ev.SIP)
+	}
+}
+
+// sendSIPFinal is like sendSIP but skips 1xx provisional responses.
+func (h *harness) sendSIPFinal(msg string) string {
+	h.t.Helper()
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(msg), target); err != nil {
+		h.t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	buf := make([]byte, 65535)
+	for time.Now().Before(deadline) {
+		h.clientConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		n, _, err := h.clientConn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		resp := string(buf[:n])
+		code, _ := parseStatusLine(resp)
+		if code >= 200 {
+			return resp
+		}
+	}
+	h.t.Fatal("no final SIP response")
+	return ""
+}
+
+func TestEventCallAttempt(t *testing.T) {
+	h := setupHarness(t)
+	evCh := attachEventCollector(t, h)
+
+	if r := h.postText("/deploy", `function onRequest(req){ sendResponse(486, "Busy Here"); }`); r["success"] != true {
+		t.Fatalf("deploy: %v", r)
+	}
+
+	msg := buildRequest("INVITE", "sip:x@test.local", h.clientAddr.Port,
+		"caller", "callee", "ev-callattempt-1", 1,
+		[]string{fmt.Sprintf("Contact: <sip:caller@127.0.0.1:%d>", h.clientAddr.Port)}, "")
+	if code, _ := parseStatusLine(h.sendSIPFinal(msg)); code != 486 {
+		t.Fatalf("want 486, got %d", code)
+	}
+
+	ev := waitForEvent(t, evCh, "call-attempt", 2*time.Second)
+	if ev.Attrs["sip-code"] != float64(486) {
+		t.Errorf("call-attempt sip-code: want 486, got %v", ev.Attrs["sip-code"])
+	}
+	if ev.Attrs["method"] != "INVITE" {
+		t.Errorf("call-attempt method: want INVITE, got %v", ev.Attrs["method"])
+	}
+}
+
+func TestEventCallStart(t *testing.T) {
+	h := setupHarness(t)
+	evCh := attachEventCollector(t, h)
+
+	if r := h.postText("/deploy", `function onRequest(req){ sendResponse(200, "OK"); }`); r["success"] != true {
+		t.Fatalf("deploy: %v", r)
+	}
+
+	msg := buildRequest("INVITE", "sip:x@test.local", h.clientAddr.Port,
+		"caller", "callee", "ev-callstart-1", 1,
+		[]string{fmt.Sprintf("Contact: <sip:caller@127.0.0.1:%d>", h.clientAddr.Port)}, "")
+	if code, _ := parseStatusLine(h.sendSIPFinal(msg)); code != 200 {
+		t.Fatalf("want 200, got %d", code)
+	}
+
+	ev := waitForEvent(t, evCh, "call-start", 2*time.Second)
+	if ev.Attrs["sip-code"] != float64(200) {
+		t.Errorf("call-start sip-code: want 200, got %v", ev.Attrs["sip-code"])
+	}
+}
+
+func TestEventCallEndOnBYE(t *testing.T) {
+	h := setupHarness(t)
+	evCh := attachEventCollector(t, h)
+
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkPort := sinkConn.LocalAddr().(*net.UDPAddr).Port
+
+	if err := h.srv.DB.SaveBinding(&store.Binding{
+		AOR:          "sip:bob@test.local",
+		Contact:      fmt.Sprintf("sip:bob@127.0.0.1:%d", sinkPort),
+		ReceivedIP:   "127.0.0.1",
+		ReceivedPort: sinkPort,
+		Transport:    "UDP",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if r := h.postText("/deploy", `function onRequest(req){
+        if (req.method === "INVITE") {
+            setupDialog({});
+            var c = lookup();
+            if (c.length > 0) proxy(c[0]);
+            else sendResponse(404);
+            return;
+        }
+        sendResponse(405);
+    }`); r["success"] != true {
+		t.Fatalf("deploy: %v", r)
+	}
+
+	callID := "ev-callend-1"
+	branch := "z9hG4bK-ev-callend"
+	fromTag := "alice-ev-tag"
+	invite := buildRequestExplicit("INVITE", "sip:bob@test.local", h.clientAddr.Port,
+		"alice", "bob", callID, 1, branch, fromTag,
+		[]string{fmt.Sprintf("Contact: <sip:alice@127.0.0.1:%d>", h.clientAddr.Port)}, "")
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(invite), target); err != nil {
+		t.Fatal(err)
+	}
+
+	// Drain forwarded INVITE on sink.
+	sinkConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := sinkConn.ReadFromUDP(make([]byte, 65535)); err != nil {
+		t.Fatalf("sink did not receive forwarded INVITE: %v", err)
+	}
+
+	bye := buildInDialogRequest("BYE", "sip:bob@127.0.0.1", h.clientAddr.Port,
+		"alice", "bob", callID, 2, "z9hG4bK-bye", fromTag, "bob-tag",
+		nil, "")
+	if _, err := h.clientConn.WriteToUDP([]byte(bye), target); err != nil {
+		t.Fatal(err)
+	}
+
+	ev := waitForEvent(t, evCh, "call-end", 2*time.Second)
+	if ev.Attrs["call-id"] != callID {
+		t.Errorf("call-end call-id: want %q, got %v", callID, ev.Attrs["call-id"])
+	}
+	if ev.SIP == nil || ev.SIP.Originator != "caller-terminated" {
+		t.Errorf("call-end originator: want caller-terminated, got %#v", ev.SIP)
+	}
+}
+
+func TestEventRegNew(t *testing.T) {
+	h := setupHarness(t)
+	h.addSubscriber("alice", "test.local", "secret")
+	evCh := attachEventCollector(t, h)
+
+	registerUser(t, h, "alice", "secret", "ev-regnew", 1)
+
+	ev := waitForEvent(t, evCh, "reg-new", 2*time.Second)
+	if ev.Attrs["aor"] != "sip:alice@test.local" {
+		t.Errorf("reg-new aor: %v", ev.Attrs["aor"])
+	}
+	if ev.SIP == nil || ev.SIP.Contact == "" {
+		t.Errorf("reg-new sip.contact missing")
+	}
+}
+
+func TestEventRegDel(t *testing.T) {
+	h := setupHarness(t)
+	h.addSubscriber("alice", "test.local", "secret")
+	evCh := attachEventCollector(t, h)
+
+	// First register — drain reg-new.
+	registerUser(t, h, "alice", "secret", "ev-regdel", 1)
+	waitForEvent(t, evCh, "reg-new", 2*time.Second)
+
+	// Now de-register: send REGISTER with Expires: 0.
+	deRegister(t, h, "alice", "secret", "ev-regdel-off", 3)
+
+	ev := waitForEvent(t, evCh, "reg-del", 2*time.Second)
+	if ev.Attrs["aor"] != "sip:alice@test.local" {
+		t.Errorf("reg-del aor: %v", ev.Attrs["aor"])
+	}
+}
+
+func TestEventRegExpired(t *testing.T) {
+	h := setupHarness(t)
+	evCh := attachEventCollector(t, h)
+
+	// Insert a binding that's already expired.
+	if err := h.srv.DB.SaveBinding(&store.Binding{
+		AOR:          "sip:gone@test.local",
+		Contact:      "sip:gone@1.2.3.4:5060",
+		ExpiresAt:    time.Now().Add(-time.Second),
+		ReceivedIP:   "1.2.3.4",
+		ReceivedPort: 5060,
+		Transport:    "UDP",
+		CallID:       "ev-regexp-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	h.srv.Registrar.SweepExpired()
+
+	ev := waitForEvent(t, evCh, "reg-expired", 2*time.Second)
+	if ev.Attrs["aor"] != "sip:gone@test.local" {
+		t.Errorf("reg-expired aor: %v", ev.Attrs["aor"])
+	}
+}
+
+// deRegister authenticates a REGISTER with Expires: 0 to remove a
+// binding. Expects a 200 response.
+func deRegister(t *testing.T, h *harness, username, password, callID string, cseq int) {
+	t.Helper()
+	contact := fmt.Sprintf("Contact: <sip:%s@127.0.0.1:%d>", username, h.clientAddr.Port)
+	msg := buildRequest("REGISTER", "sip:test.local", h.clientAddr.Port,
+		username, username, callID, cseq,
+		[]string{contact, "Expires: 0"}, "")
+	resp := h.sendSIP(msg)
+	if code, _ := parseStatusLine(resp); code != 401 {
+		t.Fatalf("expected 401 first, got %d", code)
+	}
+	nonce := extractAuthParam(extractHeader(resp, "WWW-Authenticate"), "nonce")
+	authHeader := buildDigestAuth(username, "test.local", password, nonce, "REGISTER", "sip:test.local")
+	msg2 := buildRequest("REGISTER", "sip:test.local", h.clientAddr.Port,
+		username, username, callID+"b", cseq+1,
+		[]string{contact, "Expires: 0", "Authorization: " + authHeader}, "")
+	resp2 := h.sendSIP(msg2)
+	if code, _ := parseStatusLine(resp2); code != 200 {
+		t.Fatalf("de-register: want 200, got %d\n%s", code, resp2)
+	}
+}
 
 // ---------- TCP connection reuse / alias table ----------
 

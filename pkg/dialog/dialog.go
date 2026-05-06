@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/intuitivelabs/funsip/pkg/events"
 	"github.com/intuitivelabs/funsip/pkg/metrics"
 	"github.com/intuitivelabs/funsip/pkg/pcap"
 	"github.com/intuitivelabs/funsip/pkg/sip"
@@ -62,9 +63,13 @@ type Manager struct {
 	localIP      string
 	localPort    int
 	mediaCleanup func(callID string)
+	events       *events.Sink
 
 	dlgGate atomic.Bool
 }
+
+// SetEventSink wires the event sink for call-end emissions.
+func (m *Manager) SetEventSink(s *events.Sink) { m.events = s }
 
 func NewManager(sender Sender, m *metrics.Metrics, localIP string, localPort int, pcapDir string) *Manager {
 	return &Manager{
@@ -107,8 +112,9 @@ type Dialog struct {
 	dlgGate   bool
 	pcap      *pcap.Writer
 
-	timer   *time.Timer
-	timeout time.Duration
+	timer     *time.Timer
+	timeout   time.Duration
+	createdAt time.Time
 
 	cseq atomic.Int64
 
@@ -165,11 +171,12 @@ func (m *Manager) Setup(req *sip.Message, opts Options) (*Dialog, error) {
 	}
 
 	d := &Dialog{
-		CallID:  req.CallID(),
-		caller:  caller,
-		dlgGate: opts.DlgGate,
-		timeout: opts.timeout(),
-		manager: m,
+		CallID:    req.CallID(),
+		caller:    caller,
+		dlgGate:   opts.DlgGate,
+		timeout:   opts.timeout(),
+		createdAt: time.Now(),
+		manager:   m,
 	}
 
 	if opts.Pcap && m.pcapDir != "" {
@@ -279,8 +286,11 @@ func (m *Manager) FindFor(req *sip.Message) *Dialog {
 	return nil
 }
 
-// Terminate removes the dialog (called on BYE).
-func (m *Manager) Terminate(callID string) bool {
+// Terminate removes the dialog (called on BYE). The originator
+// label ("caller-terminated" / "callee-terminated") is included in
+// the call-end event when the side that sent the BYE can be told
+// apart, otherwise an empty string is fine.
+func (m *Manager) Terminate(callID string, byeReq *sip.Message) bool {
 	m.mu.Lock()
 	d, ok := m.dialogs[callID]
 	if ok {
@@ -293,6 +303,11 @@ func (m *Manager) Terminate(callID string) bool {
 	if d.timer != nil {
 		d.timer.Stop()
 	}
+	originator := whoTerminated(d, byeReq)
+	if m.events != nil && byeReq != nil {
+		m.events.Send(events.FromRequest("call-end", byeReq).
+			WithDuration(time.Since(d.createdAt), originator))
+	}
 	if d.pcap != nil {
 		d.pcap.Close()
 	}
@@ -300,6 +315,29 @@ func (m *Manager) Terminate(callID string) bool {
 		m.metrics.RecordDialogCompleted()
 	}
 	return true
+}
+
+// whoTerminated decides "caller-terminated" vs "callee-terminated"
+// from the BYE's From-tag — whichever side's tag matches sent the
+// BYE. Returns "" if it cannot be determined.
+func whoTerminated(d *Dialog, byeReq *sip.Message) string {
+	if byeReq == nil {
+		return ""
+	}
+	from := byeReq.From()
+	if from == nil {
+		return ""
+	}
+	tag := from.Tag()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.caller != nil && tag == d.caller.Tag {
+		return "caller-terminated"
+	}
+	if d.callee != nil && tag == d.callee.Tag {
+		return "callee-terminated"
+	}
+	return ""
 }
 
 // CapturePacket records a SIP packet to the per-dialog pcap file if
@@ -360,12 +398,72 @@ func (m *Manager) fireTimeout(d *Dialog) {
 		m.mediaCleanup(d.CallID)
 	}
 
+	if m.events != nil {
+		ev := buildCallEndFromDialog(d, "timeout")
+		m.events.Send(ev)
+	}
+
 	if d.pcap != nil {
 		d.pcap.Close()
 	}
 	if m.metrics != nil {
 		m.metrics.RecordDialogTimedOut()
 	}
+}
+
+// buildCallEndFromDialog synthesizes a call-end event from dialog
+// state alone (no SIP request available). Used by the timeout path.
+func buildCallEndFromDialog(d *Dialog, originator string) *events.Event {
+	d.mu.Lock()
+	caller := d.caller
+	callee := d.callee
+	d.mu.Unlock()
+
+	ev := &events.Event{
+		Timestamp: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+		Type:      "event",
+		Type2:     "call-end",
+		Attrs: map[string]interface{}{
+			"type":    "call-end",
+			"call-id": d.CallID,
+			"method":  "INVITE",
+		},
+		SIP: &events.SIPInfo{
+			CallID:     d.CallID,
+			Originator: originator,
+			Request:    &events.RequestInfo{Method: "INVITE"},
+		},
+	}
+	if caller != nil {
+		if caller.AOR != nil {
+			ev.Attrs["from"] = caller.AOR.String()
+			ev.Attrs["from-domain"] = caller.AOR.Host
+			ev.SIP.From = caller.AOR.String()
+		}
+		ev.SIP.FromTag = caller.Tag
+		ev.Attrs["source"] = stripPort(caller.Addr)
+		ev.Attrs["transport"] = caller.Transport
+	}
+	if callee != nil {
+		if callee.AOR != nil {
+			ev.Attrs["to"] = callee.AOR.String()
+			ev.SIP.To = callee.AOR.String()
+		}
+		ev.SIP.ToTag = callee.Tag
+	}
+	secs := int64(time.Since(d.createdAt).Seconds())
+	ev.Attrs["duration"] = secs
+	ev.EventInfo = map[string]interface{}{"duration": secs}
+	return ev
+}
+
+func stripPort(hostport string) string {
+	for i := len(hostport) - 1; i >= 0; i-- {
+		if hostport[i] == ':' {
+			return hostport[:i]
+		}
+	}
+	return hostport
 }
 
 // sendBYE constructs a BYE as if "from" sent it to "to" and pushes it

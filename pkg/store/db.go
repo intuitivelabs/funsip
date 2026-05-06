@@ -248,6 +248,43 @@ func (d *DB) ListAllBindings() ([]*Binding, error) {
 	return result, nil
 }
 
+// ExpireBindings deletes every binding whose expires_at is in the
+// past and returns those entries as they were just before deletion.
+// Used by the registrar's expiry sweeper to emit reg-expired events.
+func (d *DB) ExpireBindings() ([]*Binding, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	now := time.Now().Unix()
+	rows, err := d.db.Query(
+		"SELECT aor, contact, expires_at, received_ip, received_port, transport, user_agent, call_id, cseq FROM location WHERE expires_at <= ?",
+		now,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var expired []*Binding
+	for rows.Next() {
+		b := &Binding{}
+		var expiresUnix int64
+		if err := rows.Scan(&b.AOR, &b.Contact, &expiresUnix, &b.ReceivedIP, &b.ReceivedPort, &b.Transport, &b.UserAgent, &b.CallID, &b.CSeq); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		b.ExpiresAt = time.Unix(expiresUnix, 0)
+		expired = append(expired, b)
+	}
+	rows.Close()
+
+	if len(expired) > 0 {
+		if _, err := d.db.Exec("DELETE FROM location WHERE expires_at <= ?", now); err != nil {
+			return expired, err
+		}
+	}
+	return expired, nil
+}
+
 func (d *DB) PurgeExpired() (int64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
