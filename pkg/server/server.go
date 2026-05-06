@@ -53,6 +53,7 @@ func New(cfg *config.Config) (*Server, error) {
 	s.Proxy = proxy.New(s.TxLayer, cfg.ListenIP, cfg.ListenPort, cfg.Domain, s.Metrics)
 	s.Media = media.NewManager(cfg.ListenIP)
 	s.Proxy.SetMediaManager(s.Media)
+	s.Proxy.SetMediaDir(cfg.PCAPDir)
 	s.Registrar = registrar.New(db)
 	s.Auth = auth.NewDigestAuth(db, cfg.Domain)
 	s.Dialogs = dialog.NewManager(s.Transport, s.Metrics, cfg.ListenIP, cfg.ListenPort, cfg.PCAPDir)
@@ -64,6 +65,13 @@ func New(cfg *config.Config) (*Server, error) {
 
 	s.Proxy.SetDialogConfirm(s.Dialogs.ConfirmFromResponse)
 	s.Dialogs.SetMediaCleanup(s.Proxy.CleanupMediaForCallID)
+	s.Dialogs.SetMediaReporter(func(callID string) interface{} {
+		r := s.Media.ReportFor(callID)
+		if r == nil {
+			return nil
+		}
+		return r
+	})
 	s.Transport.SetCaptureHook(s.Dialogs.CapturePacket)
 
 	eng, err := script.NewEngine(cfg.ScriptPath, s.Proxy, s.Registrar, s.Auth, db)

@@ -110,7 +110,7 @@ The routing script is JavaScript executed for each out-of-dialog or dialog-initi
 | `sendResponse(code, reason)` | Send a SIP response to the current request. |
 | `sendResponse(code, reason, headers)` | Same as above, plus extra response headers. `headers` is an object `{"X-Foo": "bar", "X-List": ["a", "b"]}` or an array of `"Name: value"` strings. |
 | `setupDialog({dlgGate: bool, pcap: bool, timeout: secs})` | Track this INVITE as a SIP dialog. The early dialog is created on the dialog-initiating INVITE (no To-tag) and confirmed when a 2xx response with a To-tag passes through. On BYE the dialog is torn down implicitly. Options: `dlgGate` (server-wide once enabled — in-dialog requests with no matching dialog are answered 481 and not forwarded); `pcap` (capture all signaling for this Call-ID into a per-dialog `.pcap` file in the configured directory; writes are batched on a separate goroutine and never block SIP/RTP); `timeout` in seconds (default 3660 — 61 min). When the timeout fires the stack acts as a back-to-back UA: a BYE is sent to each side and a separate counter is bumped. |
-| `anchorMedia({symmetric: bool, idleTimeout: secs})` | Anchor RTP/RTCP through this server. The SDP body of the current request is parsed and rewritten so that `c=` / `m=` / `a=rtcp` point at relay sockets allocated for this Call-ID. The answer SDP in the response is rewritten symmetrically when the response passes back through the proxy. With `symmetric:true` (default) packets are forwarded to wherever the peer is observed sending from (RTP latching, NAT-friendly); with `symmetric:false` packets are forwarded to the address advertised in the original SDP. RTP and RTCP datagrams are not parsed — they are simply moved between sockets. The relay binds RTP/RTCP port pairs consecutively (rtcp = rtp+1), so all three RTCP signaling modes route correctly: `a=rtcp-mux` (RFC5761) is preserved verbatim; explicit `a=rtcp:port` (RFC3605) is rewritten to the relay's RTCP port; implicit (no `a=rtcp`, peer assumes rtp+1) needs no rewrite — the relay's `rtp+1` already matches. Sockets are released on BYE, when the dialog times out (B2BUA path), and when no RTP has been observed for `idleTimeout` (default 120 s) — but only if neither side has signalled hold via `a=sendonly`, `a=inactive`, or `c=IN IP4 0.0.0.0`. |
+| `anchorMedia({symmetric, idleTimeout, pcap, wav, dtmf, qos})` | Anchor RTP/RTCP through this server. The SDP body of the current request is parsed and rewritten so that `c=` / `m=` / `a=rtcp` point at relay sockets allocated for this Call-ID. The answer SDP in the response is rewritten symmetrically when the response passes back through the proxy. With `symmetric:true` (default) packets are forwarded to wherever the peer is observed sending from (RTP latching, NAT-friendly); with `symmetric:false` packets are forwarded to the address advertised in the original SDP. The relay binds RTP/RTCP port pairs consecutively (rtcp = rtp+1), so all three RTCP signaling modes route correctly: `a=rtcp-mux` (RFC5761) is preserved verbatim; explicit `a=rtcp:port` (RFC3605) is rewritten to the relay's RTCP port; implicit (no `a=rtcp`, peer assumes rtp+1) needs no rewrite. Sockets are released on BYE, when the dialog times out (B2BUA path), and when no RTP has been observed for `idleTimeout` (default 120 s) — but only if neither side has signalled hold via `a=sendonly`, `a=inactive`, or `c=IN IP4 0.0.0.0`. **Optional analyzers (default off):** `pcap:true` writes every received RTP/RTCP datagram to a per-call `.pcap` file; `wav:true` decodes G.711 audio (PT 0 / 8) into one mono 16-bit-PCM `.wav` file per direction; `dtmf:true` parses RFC4733 named telephone events (auto-detected from `a=rtpmap` `telephone-event`) and runs the six quality checks listed below; `qos:true` tracks RTP packet loss and inter-arrival jitter (RFC3550 §A.8) and computes a simplified ITU E-model MoS. All analyzer file writes are batched on a separate goroutine and never block the SIP/RTP datapath. |
 | `appendHeader(name, value)` | Append a header to the current request (also propagates into anything proxied afterwards). Multiple calls add multiple values. |
 | `removeHeader(name)` | Remove all instances of a header by name. Compact forms (e.g. `"v"` for `Via`, `"f"` for `From`) are accepted. |
 | `setRequestUri(uri)` | Rewrite the Request-URI. Argument is a URI string (`"sip:user@host:port"`) or a partial-update object (`{user: "...", host: "...", port: 5060}`). |
@@ -161,7 +161,22 @@ Each event has the shape
 }
 ```
 
-`call-end` additionally carries `attrs.duration` (seconds), `event.duration`, and `sip.originator`.
+`call-end` additionally carries `attrs.duration` (seconds), `event.duration`, and `sip.originator`. When `anchorMedia` analyzers were active, `event.media` carries:
+
+- `dtmf` — array of detected RFC4733 telephone events. Each entry has `digit`, `duration_ms`, `volume_dbm0`, `packet_count`, `end_packets`, `had_end`, plus arrays of `errors` and `warnings`. Quality checks applied per event:
+
+  | # | Check | Threshold | Severity |
+  |---|---|---|---|
+  | 1 | Duration too short | `< 40 ms` = error, `< 80 ms` = warn | error/warn |
+  | 2 | Excessive duration (stuck key/signaling) | `> 1000 ms` | warn |
+  | 3 | Missing end flag | end bit absent | error |
+  | 4 | Low packet redundancy | `< 3` end packets | warn |
+  | 5 | Low volume | attenuation `> 36` dBm0 | warn |
+  | 6 | Short inter-digit gap | `< 40 ms` (ITU-T Q.24) | warn |
+
+- `qos` — `packets_received`, `packets_lost`, `loss_percent`, `jitter_ms`, `mos` (ITU E-model, simplified: `R0=93.2`, `Ie≈30·loss%`, MoS clamped to [1, 4.5]).
+- `wav` — array of file paths (one per direction).
+- `pcap` — path to the per-call media pcap file.
 - **Dialog cleanup on BYE**: if the script enabled dialog tracking via `setupDialog`, an in-dialog BYE matching a known dialog tears down the dialog state (cancels the timeout timer, closes the per-dialog PCAP file) before the BYE is forwarded.
 - **Dialog timeout B2BUA**: if no BYE arrives within the configured timeout (default 61 min), the stack sends a BYE to each side of the call (Caller→Callee and Callee→Caller, each with its own From/To and a CSeq high enough to outrank in-dialog use), increments the `dialogs.timed_out` counter, and removes the dialog state.
 

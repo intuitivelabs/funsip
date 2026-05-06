@@ -63,6 +63,7 @@ type Manager struct {
 	localIP      string
 	localPort    int
 	mediaCleanup func(callID string)
+	mediaReport  func(callID string) interface{}
 	events       *events.Sink
 
 	dlgGate atomic.Bool
@@ -70,6 +71,14 @@ type Manager struct {
 
 // SetEventSink wires the event sink for call-end emissions.
 func (m *Manager) SetEventSink(s *events.Sink) { m.events = s }
+
+// SetMediaReporter registers a callback used by the call-end emitter
+// to attach the media analyzer's findings (DTMF, QoS, file paths)
+// to the event. The dialog package does not import media to avoid
+// a cycle; the value returned is JSON-encoded as-is.
+func (m *Manager) SetMediaReporter(fn func(callID string) interface{}) {
+	m.mediaReport = fn
+}
 
 func NewManager(sender Sender, m *metrics.Metrics, localIP string, localPort int, pcapDir string) *Manager {
 	return &Manager{
@@ -305,8 +314,17 @@ func (m *Manager) Terminate(callID string, byeReq *sip.Message) bool {
 	}
 	originator := whoTerminated(d, byeReq)
 	if m.events != nil && byeReq != nil {
-		m.events.Send(events.FromRequest("call-end", byeReq).
-			WithDuration(time.Since(d.createdAt), originator))
+		ev := events.FromRequest("call-end", byeReq).
+			WithDuration(time.Since(d.createdAt), originator)
+		if m.mediaReport != nil {
+			if rep := m.mediaReport(callID); rep != nil {
+				if ev.EventInfo == nil {
+					ev.EventInfo = map[string]interface{}{}
+				}
+				ev.EventInfo["media"] = rep
+			}
+		}
+		m.events.Send(ev)
 	}
 	if d.pcap != nil {
 		d.pcap.Close()
@@ -394,12 +412,22 @@ func (m *Manager) fireTimeout(d *Dialog) {
 		m.sendBYE(d.CallID, callee, caller, baseCSeq+1)
 	}
 
+	var mediaRep interface{}
+	if m.mediaReport != nil {
+		mediaRep = m.mediaReport(d.CallID)
+	}
 	if m.mediaCleanup != nil {
 		m.mediaCleanup(d.CallID)
 	}
 
 	if m.events != nil {
 		ev := buildCallEndFromDialog(d, "timeout")
+		if mediaRep != nil {
+			if ev.EventInfo == nil {
+				ev.EventInfo = map[string]interface{}{}
+			}
+			ev.EventInfo["media"] = mediaRep
+		}
 		m.events.Send(ev)
 	}
 

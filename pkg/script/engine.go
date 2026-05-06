@@ -362,6 +362,18 @@ func (e *Engine) registerFunctions(vm *goja.Runtime, req *sip.Message) {
 				if v, ok := m["symmetric"].(bool); ok {
 					opts.Symmetric = v
 				}
+				if v, ok := m["pcap"].(bool); ok {
+					opts.PCAP = v
+				}
+				if v, ok := m["wav"].(bool); ok {
+					opts.WAV = v
+				}
+				if v, ok := m["dtmf"].(bool); ok {
+					opts.DTMF = v
+				}
+				if v, ok := m["qos"].(bool); ok {
+					opts.QoS = v
+				}
 				switch v := m["idleTimeout"].(type) {
 				case int64:
 					opts.IdleTimeout = time.Duration(v) * time.Second

@@ -1296,6 +1296,270 @@ function onRequest(req) {
 // importing the package directly via a long path.
 func sdpParse(s string) (*sdp.SDP, error) { return sdp.Parse([]byte(s)) }
 
+// ---------- RTP analyzer (PCAP + WAV + DTMF + QoS) ----------
+
+// rtpPacket builds a minimal RTPv2 packet (12-byte header + payload)
+// for use in tests.
+func rtpPacket(pt uint8, seq uint16, ts uint32, ssrc uint32, payload []byte) []byte {
+	pkt := make([]byte, 12+len(payload))
+	pkt[0] = 0x80 // V=2, no padding/extension/CSRC
+	pkt[1] = pt & 0x7f
+	pkt[2] = byte(seq >> 8)
+	pkt[3] = byte(seq)
+	pkt[4] = byte(ts >> 24)
+	pkt[5] = byte(ts >> 16)
+	pkt[6] = byte(ts >> 8)
+	pkt[7] = byte(ts)
+	pkt[8] = byte(ssrc >> 24)
+	pkt[9] = byte(ssrc >> 16)
+	pkt[10] = byte(ssrc >> 8)
+	pkt[11] = byte(ssrc)
+	copy(pkt[12:], payload)
+	return pkt
+}
+
+// dtmfPayload builds an RFC4733 telephone-event payload.
+func dtmfPayload(event uint8, end bool, volume uint8, duration uint16) []byte {
+	p := make([]byte, 4)
+	p[0] = event
+	p[1] = volume & 0x3f
+	if end {
+		p[1] |= 0x80
+	}
+	p[2] = byte(duration >> 8)
+	p[3] = byte(duration)
+	return p
+}
+
+func TestAnalyzerDTMFAndQoSInCallEnd(t *testing.T) {
+	h := setupHarness(t)
+
+	// Wire artifact dir into the proxy (the live server always
+	// sets it; the harness leaves it empty).
+	mediaDir, err := os.MkdirTemp("", "funsip-media-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(mediaDir)
+	h.srv.Proxy.SetMediaDir(mediaDir)
+
+	evCh := attachEventCollector(t, h)
+
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkPort := sinkConn.LocalAddr().(*net.UDPAddr).Port
+
+	if err := h.srv.DB.SaveBinding(&store.Binding{
+		AOR:          "sip:bob@test.local",
+		Contact:      fmt.Sprintf("sip:bob@127.0.0.1:%d", sinkPort),
+		ReceivedIP:   "127.0.0.1",
+		ReceivedPort: sinkPort,
+		Transport:    "UDP",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	script := `function onRequest(req){
+        if (req.method === "INVITE") {
+            setupDialog({});
+            anchorMedia({pcap: true, wav: true, dtmf: true, qos: true});
+            var c = lookup();
+            if (c.length > 0) proxy(c[0]);
+            else sendResponse(404);
+            return;
+        }
+        sendResponse(405);
+    }`
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy: %v", r)
+	}
+
+	callID := "rtp-analyzer-1"
+	branch := "z9hG4bK-rtp-analyzer"
+	fromTag := "alice-rtpa-tag"
+
+	// Offer SDP advertises PCMU (PT 0) and telephone-event (PT 101).
+	// We bind a "caller" socket whose port the proxy will rewrite.
+	callerConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer callerConn.Close()
+	callerRtpPort := callerConn.LocalAddr().(*net.UDPAddr).Port
+	offer := fmt.Sprintf("v=0\r\no=alice 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio %d RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-15\r\n", callerRtpPort)
+
+	invite := buildRequestExplicit("INVITE", "sip:bob@test.local", h.clientAddr.Port,
+		"alice", "bob", callID, 1, branch, fromTag,
+		[]string{
+			fmt.Sprintf("Contact: <sip:alice@127.0.0.1:%d>", h.clientAddr.Port),
+			"Content-Type: application/sdp",
+			fmt.Sprintf("Content-Length: %d", len(offer)),
+		}, offer)
+
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(invite), target); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read forwarded INVITE on sink to learn the relay's A-side rtp
+	// port (that is the port the sink would send to to reach alice).
+	sinkConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 65535)
+	n, _, err := sinkConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("sink did not receive forwarded INVITE: %v", err)
+	}
+	fwdInv := string(buf[:n])
+	bodyIdx := strings.Index(fwdInv, "\r\n\r\n")
+	if bodyIdx < 0 {
+		t.Fatal("forwarded INVITE has no body")
+	}
+	relayBody := fwdInv[bodyIdx+4:]
+	relayParsed, err := sdp.Parse([]byte(relayBody))
+	if err != nil {
+		t.Fatalf("parse relay SDP: %v", err)
+	}
+	relayARtpPort := relayParsed.Media[0].Port
+
+	// Pump synthetic RTP into the relay's A-side port (so the
+	// analyzer's "speaker B" tracker registers them — but that's an
+	// implementation detail; what matters is that DTMF + QoS records
+	// flow). Send 5 PCMU packets, then 3 DTMF packets for digit "5"
+	// (end bit on last 3), then 5 more PCMU packets. Skip seq 7 to
+	// induce one packet "loss".
+	rtpDst := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: relayARtpPort}
+
+	pcmuPayload := make([]byte, 160) // 20ms at 8kHz
+	for i := range pcmuPayload {
+		pcmuPayload[i] = 0xFF // µ-law silence
+	}
+
+	send := func(seq uint16, ts uint32, pt uint8, payload []byte) {
+		t.Helper()
+		if _, err := callerConn.WriteToUDP(rtpPacket(pt, seq, ts, 0xCAFE, payload), rtpDst); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 5 audio packets, sequential
+	for i := uint16(1); i <= 5; i++ {
+		send(i, uint32(i)*160, 0, pcmuPayload)
+	}
+	// 3 DTMF packets for digit 5, all with end bit, same RTP timestamp
+	dtmfTS := uint32(6) * 160
+	send(6, dtmfTS, 101, dtmfPayload(5, true, 10, 320)) // 320 ts units = 40ms
+	send(7, dtmfTS, 101, dtmfPayload(5, true, 10, 320))
+	send(8, dtmfTS, 101, dtmfPayload(5, true, 10, 320))
+	// More audio, with one gap (skip seq 10 to simulate loss)
+	send(9, uint32(9)*160, 0, pcmuPayload)
+	send(11, uint32(11)*160, 0, pcmuPayload)
+	send(12, uint32(12)*160, 0, pcmuPayload)
+
+	// Give the relay time to process.
+	time.Sleep(200 * time.Millisecond)
+
+	// Send BYE to close the dialog and trigger call-end emission.
+	bye := buildInDialogRequest("BYE", "sip:bob@127.0.0.1", h.clientAddr.Port,
+		"alice", "bob", callID, 2, "z9hG4bK-rtpa-bye", fromTag, "bob-tag-rtpa",
+		nil, "")
+	if _, err := h.clientConn.WriteToUDP([]byte(bye), target); err != nil {
+		t.Fatal(err)
+	}
+
+	ev := waitForEvent(t, evCh, "call-end", 3*time.Second)
+	mediaRaw, ok := ev.EventInfo["media"]
+	if !ok {
+		t.Fatalf("call-end event has no event.media field: %+v", ev.EventInfo)
+	}
+	mediaMap, ok := mediaRaw.(map[string]interface{})
+	if !ok {
+		t.Fatalf("event.media has unexpected type %T", mediaRaw)
+	}
+
+	// DTMF: at least one digit reported as "5".
+	dtmfRaw, ok := mediaMap["dtmf"].([]interface{})
+	if !ok || len(dtmfRaw) == 0 {
+		t.Fatalf("call-end media.dtmf missing or empty: %#v", mediaMap["dtmf"])
+	}
+	first := dtmfRaw[0].(map[string]interface{})
+	if first["digit"] != "5" {
+		t.Errorf("DTMF digit: want \"5\", got %v", first["digit"])
+	}
+	if pkts, _ := first["packet_count"].(float64); pkts < 3 {
+		t.Errorf("DTMF packet_count: want >=3, got %v", pkts)
+	}
+	if ends, _ := first["end_packets"].(float64); ends < 3 {
+		t.Errorf("DTMF end_packets: want >=3, got %v", ends)
+	}
+	if had, _ := first["had_end"].(bool); !had {
+		t.Error("DTMF had_end: want true")
+	}
+	// 320 ts units / 8000 Hz = 40 ms exactly — should not trigger
+	// "duration_too_short" (< 40 ms = error).
+	if errsRaw, ok := first["errors"].([]interface{}); ok {
+		for _, e := range errsRaw {
+			if e == "duration_too_short" || e == "missing_end_flag" {
+				t.Errorf("DTMF unexpected error %v", e)
+			}
+		}
+	}
+
+	// QoS: should have packets received and a non-zero MoS.
+	qosRaw, ok := mediaMap["qos"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("call-end media.qos missing: %#v", mediaMap["qos"])
+	}
+	if recv, _ := qosRaw["packets_received"].(float64); recv < 5 {
+		t.Errorf("QoS packets_received: want >=5, got %v", recv)
+	}
+	if mos, _ := qosRaw["mos"].(float64); mos <= 1.0 {
+		t.Errorf("QoS mos: want >1.0, got %v", mos)
+	}
+
+	// Wav files referenced (the call-end event references them
+	// before they're closed; closure happens on session cleanup).
+	if wavRaw, ok := mediaMap["wav"].([]interface{}); !ok || len(wavRaw) == 0 {
+		t.Errorf("call-end media.wav missing or empty: %#v", mediaMap["wav"])
+	}
+	// PCAP file referenced.
+	if pcapPath, _ := mediaMap["pcap"].(string); pcapPath == "" {
+		t.Errorf("call-end media.pcap missing")
+	}
+
+	// After cleanup, the WAV files on disk should exist with the
+	// canonical RIFF header. We trigger cleanup by terminating the
+	// dialog, which the BYE already did.
+	time.Sleep(200 * time.Millisecond)
+	entries, _ := os.ReadDir(mediaDir)
+	var wavFound, pcapFound bool
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".wav") {
+			f, err := os.Open(filepath.Join(mediaDir, e.Name()))
+			if err == nil {
+				hdr := make([]byte, 4)
+				_, _ = f.Read(hdr)
+				f.Close()
+				if string(hdr) == "RIFF" {
+					wavFound = true
+				}
+			}
+		}
+		if strings.HasSuffix(e.Name(), ".pcap") {
+			pcapFound = true
+		}
+	}
+	if !wavFound {
+		t.Error("expected at least one .wav file with RIFF header in media dir")
+	}
+	if !pcapFound {
+		t.Error("expected a .pcap file in media dir")
+	}
+}
+
 // ---------- Event emission ----------
 
 // attachEventCollector replaces the harness's events sink with one

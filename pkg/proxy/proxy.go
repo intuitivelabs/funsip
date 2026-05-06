@@ -25,11 +25,17 @@ type Proxy struct {
 	metrics   *metrics.Metrics
 	media     *media.Manager
 	events    *events.Sink
+	mediaDir  string
 
 	confirmDialog func(resp *sip.Message)
 }
 
 func (p *Proxy) SetEventSink(s *events.Sink) { p.events = s }
+
+// SetMediaDir configures the directory where the media analyzer
+// drops its pcap and wav artifacts. Picked up by anchorMedia from
+// the cfg.PCAPDir setting.
+func (p *Proxy) SetMediaDir(dir string) { p.mediaDir = dir }
 
 func New(txLayer *transaction.Layer, localIP string, localPort int, domain string, m *metrics.Metrics) *Proxy {
 	return &Proxy{
@@ -89,6 +95,9 @@ func (p *Proxy) AnchorMedia(req *sip.Message, opts media.Options) error {
 		return fmt.Errorf("parse SDP: %w", err)
 	}
 
+	if opts.Dir == "" {
+		opts.Dir = p.mediaDir
+	}
 	sess := p.media.GetOrCreate(req.CallID(), opts)
 	if err := sess.AnchorOffer(parsed); err != nil {
 		return err
