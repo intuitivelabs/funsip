@@ -118,11 +118,12 @@ func (a *API) handleStatus(w http.ResponseWriter, r *http.Request) {
 			"avg_resp_time_ms":   txStats.AvgRespTimeMs,
 		},
 		"transport": map[string]interface{}{
-			"udp_received": tpStats.UDPReceived,
-			"udp_sent":     tpStats.UDPSent,
-			"tcp_received": tpStats.TCPReceived,
-			"tcp_sent":     tpStats.TCPSent,
-			"parse_errors": tpStats.ParseErrors,
+			"udp_received":     tpStats.UDPReceived,
+			"udp_sent":         tpStats.UDPSent,
+			"tcp_received":     tpStats.TCPReceived,
+			"tcp_sent":         tpStats.TCPSent,
+			"parse_errors":     tpStats.ParseErrors,
+			"tcp_connections":  tpStats.TCPConnections,
 		},
 	}
 

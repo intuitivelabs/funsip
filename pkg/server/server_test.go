@@ -1,16 +1,20 @@
 package server_test
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1289,6 +1293,302 @@ function onRequest(req) {
 // sdpParse is a tiny shim so the test file can call sdp.Parse without
 // importing the package directly via a long path.
 func sdpParse(s string) (*sdp.SDP, error) { return sdp.Parse([]byte(s)) }
+
+// ---------- TCP connection reuse / alias table ----------
+
+func TestTCPInboundConnectionReused(t *testing.T) {
+	h := setupHarness(t)
+
+	// Open a single TCP connection to the proxy and pipeline two
+	// OPTIONS requests on it. Both responses must come back on the
+	// same connection, and the alias table must hold exactly one
+	// entry for the duration.
+	conn, err := net.Dial("tcp4", fmt.Sprintf("127.0.0.1:%d", h.sipPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	clientPort := conn.LocalAddr().(*net.TCPAddr).Port
+
+	send := func(callID string) {
+		t.Helper()
+		req := fmt.Sprintf(
+			"OPTIONS sip:test.local SIP/2.0\r\n"+
+				"Via: SIP/2.0/TCP 127.0.0.1:%d;branch=z9hG4bK-tcp-%s;rport\r\n"+
+				"Max-Forwards: 70\r\n"+
+				"From: <sip:t@test.local>;tag=tcp-%s\r\n"+
+				"To: <sip:t@test.local>\r\n"+
+				"Call-ID: %s\r\n"+
+				"CSeq: 1 OPTIONS\r\n"+
+				"Content-Length: 0\r\n\r\n",
+			clientPort, callID, callID, callID,
+		)
+		if _, err := conn.Write([]byte(req)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	send("tcp-reuse-1")
+	send("tcp-reuse-2")
+
+	// Read two responses off the SAME connection. Use a bufio.Reader
+	// with the same SIP framing the server uses internally.
+	reader := bufio.NewReader(conn)
+	for i := 0; i < 2; i++ {
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		msg, err := readSIPFromTCP(reader)
+		if err != nil {
+			t.Fatalf("read %d: %v", i+1, err)
+		}
+		code, _ := parseStatusLine(msg)
+		if code != 200 {
+			t.Errorf("response %d: want 200, got %d", i+1, code)
+		}
+	}
+
+	// Give the accept goroutine a moment to register the conn.
+	time.Sleep(50 * time.Millisecond)
+	if got := h.srv.Transport.GetStats().TCPConnections; got != 1 {
+		t.Errorf("alias table size: want 1, got %d", got)
+	}
+}
+
+func TestTCPOutboundConnectionReused(t *testing.T) {
+	h := setupHarness(t)
+
+	// A TCP "sink" with an Accept counter. Two forwards from the
+	// proxy to this address must produce exactly ONE accepted
+	// connection at the sink because the proxy reuses its alias
+	// table entry.
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	sinkAddr := listener.Addr().String()
+	_, sinkPortStr, _ := net.SplitHostPort(sinkAddr)
+	sinkPort, _ := strconv.Atoi(sinkPortStr)
+
+	var (
+		acceptMu     sync.Mutex
+		accepts      int
+		messages     = make(chan string, 4)
+		acceptedConn net.Conn
+	)
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			acceptMu.Lock()
+			accepts++
+			if acceptedConn == nil {
+				acceptedConn = c
+			}
+			acceptMu.Unlock()
+
+			go func(c net.Conn) {
+				r := bufio.NewReader(c)
+				for {
+					m, err := readSIPFromTCP(r)
+					if err != nil {
+						return
+					}
+					messages <- m
+				}
+			}(c)
+		}
+	}()
+
+	script := fmt.Sprintf(`
+function onRequest(req) {
+    proxyTo("127.0.0.1:%d", "TCP");
+}`, sinkPort)
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy: %v", r)
+	}
+
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	for i := 1; i <= 2; i++ {
+		req := buildRequest("MESSAGE", "sip:t@test.local", h.clientAddr.Port,
+			"a", "b", fmt.Sprintf("tcp-out-%d", i), i,
+			[]string{"Content-Type: text/plain"}, "hi")
+		if _, err := h.clientConn.WriteToUDP([]byte(req), target); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Wait for both forwarded messages to land at the sink.
+	for got := 0; got < 2; got++ {
+		select {
+		case <-messages:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only received %d/2 forwarded messages", got)
+		}
+	}
+
+	acceptMu.Lock()
+	got := accepts
+	acceptMu.Unlock()
+	if got != 1 {
+		t.Errorf("sink accepted %d connections — proxy did not reuse the cached TCP socket", got)
+	}
+
+	if got := h.srv.Transport.GetStats().TCPConnections; got != 1 {
+		t.Errorf("alias table size after two forwards: want 1, got %d", got)
+	}
+}
+
+func TestTCPBrokenConnectionRedialed(t *testing.T) {
+	h := setupHarness(t)
+
+	// Sink that closes the connection right after accepting it. The
+	// first forward will succeed at the proxy's Write (the close races
+	// with the write) but the next attempt will likely find the entry
+	// broken. To make the test deterministic, we forward once, wait
+	// for the sink to close, then forward again and assert that the
+	// proxy redials and the second forward arrives at a fresh accept.
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	_, sinkPortStr, _ := net.SplitHostPort(listener.Addr().String())
+	sinkPort, _ := strconv.Atoi(sinkPortStr)
+
+	var (
+		acceptMu sync.Mutex
+		accepts  int
+		closed   = make(chan struct{}, 4)
+		messages = make(chan string, 4)
+	)
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			acceptMu.Lock()
+			accepts++
+			n := accepts
+			acceptMu.Unlock()
+
+			// First connection: read one message, then close to force
+			// the proxy to redial on the next forward. Subsequent
+			// connections stay open.
+			go func(c net.Conn, isFirst bool) {
+				r := bufio.NewReader(c)
+				m, err := readSIPFromTCP(r)
+				if err == nil {
+					messages <- m
+				}
+				if isFirst {
+					c.Close()
+					closed <- struct{}{}
+					return
+				}
+				for {
+					m, err := readSIPFromTCP(r)
+					if err != nil {
+						return
+					}
+					messages <- m
+				}
+			}(c, n == 1)
+		}
+	}()
+
+	script := fmt.Sprintf(`
+function onRequest(req) {
+    proxyTo("127.0.0.1:%d", "TCP");
+}`, sinkPort)
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy: %v", r)
+	}
+
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	send := func(i int) {
+		t.Helper()
+		req := buildRequest("MESSAGE", "sip:t@test.local", h.clientAddr.Port,
+			"a", "b", fmt.Sprintf("tcp-redial-%d", i), i,
+			[]string{"Content-Type: text/plain"}, "hi")
+		if _, err := h.clientConn.WriteToUDP([]byte(req), target); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	send(1)
+	select {
+	case <-messages:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first forward did not arrive at sink")
+	}
+	// Wait for the sink to close its end so the proxy's cached entry
+	// is now stale.
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sink did not close first connection")
+	}
+	// Give the proxy's read loop time to observe the close and prune
+	// the alias table.
+	time.Sleep(150 * time.Millisecond)
+
+	send(2)
+	select {
+	case <-messages:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second forward did not arrive — proxy did not redial")
+	}
+
+	acceptMu.Lock()
+	got := accepts
+	acceptMu.Unlock()
+	if got < 2 {
+		t.Errorf("expected the proxy to redial after broken connection, but sink only accepted %d", got)
+	}
+}
+
+// readSIPFromTCP is a tiny test helper that frames a SIP message off a
+// TCP connection: read headers until blank line, then read
+// Content-Length bytes of body.
+func readSIPFromTCP(r *bufio.Reader) (string, error) {
+	var (
+		buf      bytes.Buffer
+		clen     int
+		clenSeen bool
+	)
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return "", err
+		}
+		buf.WriteString(line)
+		trim := strings.TrimSpace(line)
+		if !clenSeen && strings.HasPrefix(strings.ToLower(trim), "content-length") {
+			parts := strings.SplitN(trim, ":", 2)
+			if len(parts) == 2 {
+				if n, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil {
+					clen = n
+					clenSeen = true
+				}
+			}
+		}
+		if trim == "" {
+			break
+		}
+	}
+	if clen > 0 {
+		body := make([]byte, clen)
+		if _, err := io.ReadFull(r, body); err != nil {
+			return "", err
+		}
+		buf.Write(body)
+	}
+	return buf.String(), nil
+}
 
 // ---------- proxy() options: recordRoute ----------
 

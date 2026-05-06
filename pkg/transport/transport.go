@@ -36,11 +36,15 @@ type Manager struct {
 }
 
 type Stats struct {
-	UDPReceived  uint64
-	UDPSent      uint64
-	TCPReceived  uint64
-	TCPSent      uint64
-	ParseErrors  uint64
+	UDPReceived uint64
+	UDPSent     uint64
+	TCPReceived uint64
+	TCPSent     uint64
+	ParseErrors uint64
+	// TCPConnections is the number of entries in the TCP alias table —
+	// i.e. live persistent TCP connections (both inbound-accepted and
+	// outbound-dialed) the transport is reusing.
+	TCPConnections int
 }
 
 func NewManager(localIP string, localPort int, handler MessageHandler) *Manager {
@@ -189,6 +193,20 @@ func (m *Manager) LocalPort() int    { return m.localPort }
 
 func (m *Manager) GetStats() Stats {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.stats
+	s := m.stats
+	m.mu.RUnlock()
+	if m.tcp != nil {
+		s.TCPConnections = m.tcp.AliasCount()
+	}
+	return s
+}
+
+// TCPAliasTable returns a snapshot of the current persistent TCP
+// connections (peer addr → local socket addr). Empty if the TCP
+// transport is not running.
+func (m *Manager) TCPAliasTable() map[string]string {
+	if m.tcp == nil {
+		return nil
+	}
+	return m.tcp.AliasTable()
 }
