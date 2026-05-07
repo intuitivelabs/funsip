@@ -24,6 +24,12 @@ import (
 // detect this and answer 408 / cancel pending INVITE branches.
 var ErrScriptTimeout = errors.New("script execution timed out")
 
+// scriptHalt is a sentinel passed to vm.Interrupt by primitives
+// that want to stop the script cleanly after sending a response —
+// for example limit() when it has just rejected a request. The
+// engine recognises it and returns nil from Execute (no error).
+type scriptHalt struct{ reason string }
+
 type Engine struct {
 	scriptPath  string
 	source      string
@@ -37,6 +43,7 @@ type Engine struct {
 	auth      *auth.DigestAuth
 	db        *store.DB
 	dialogs   *dialog.Manager
+	limiter   *rateLimiter
 }
 
 func (e *Engine) SetDialogManager(m *dialog.Manager) { e.dialogs = m }
@@ -57,6 +64,7 @@ func NewEngine(scriptPath string, p *proxy.Proxy, r *registrar.Registrar, a *aut
 		registrar:  r,
 		auth:       a,
 		db:         db,
+		limiter:    newRateLimiter(),
 	}
 	if err := e.Load(); err != nil {
 		return nil, err
@@ -191,7 +199,10 @@ func (e *Engine) Execute(req *sip.Message) error {
 	defer timer.Stop()
 
 	if _, err := vm.RunProgram(prg); err != nil {
-		if isInterrupt(err) {
+		switch classifyInterrupt(err) {
+		case interruptHalt:
+			return nil
+		case interruptTimeout:
 			return ErrScriptTimeout
 		}
 		return fmt.Errorf("run script: %w", err)
@@ -203,7 +214,10 @@ func (e *Engine) Execute(req *sip.Message) error {
 	}
 
 	if _, err := onRequest(goja.Undefined(), reqObj); err != nil {
-		if isInterrupt(err) {
+		switch classifyInterrupt(err) {
+		case interruptHalt:
+			return nil
+		case interruptTimeout:
 			return ErrScriptTimeout
 		}
 		return fmt.Errorf("onRequest: %w", err)
@@ -212,12 +226,26 @@ func (e *Engine) Execute(req *sip.Message) error {
 	return nil
 }
 
-// isInterrupt reports whether err is the goja interrupt the
-// watchdog timer triggered above. Any *goja.InterruptedError is
-// treated as a script timeout.
-func isInterrupt(err error) bool {
+type interruptKind int
+
+const (
+	interruptNone interruptKind = iota
+	interruptHalt
+	interruptTimeout
+)
+
+// classifyInterrupt distinguishes a deliberate script halt (limit()
+// kicked in, response already sent) from a watchdog timeout from a
+// non-interrupt JS error.
+func classifyInterrupt(err error) interruptKind {
 	var ie *goja.InterruptedError
-	return errors.As(err, &ie)
+	if !errors.As(err, &ie) {
+		return interruptNone
+	}
+	if _, ok := ie.Value().(scriptHalt); ok {
+		return interruptHalt
+	}
+	return interruptTimeout
 }
 
 func (e *Engine) buildRequestObject(vm *goja.Runtime, req *sip.Message) goja.Value {
@@ -229,6 +257,9 @@ func (e *Engine) buildRequestObject(vm *goja.Runtime, req *sip.Message) goja.Val
 	obj.Set("cseqMethod", req.CSeqMethod())
 	obj.Set("sourceIp", req.SourceIP)
 	obj.Set("sourcePort", req.SourcePort)
+	// Convenience aliases — the rate-limiter examples use req.ip.
+	obj.Set("ip", req.SourceIP)
+	obj.Set("port", req.SourcePort)
 	obj.Set("transport", req.Transport)
 
 	if req.RequestURI != nil {
@@ -360,6 +391,43 @@ func (e *Engine) registerFunctions(vm *goja.Runtime, req *sip.Message) {
 		}
 		name := sip.NormalizeHeaderName(call.Argument(0).String())
 		req.Headers.Remove(name)
+		return goja.Undefined()
+	})
+
+	vm.Set("limit", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			return goja.Undefined()
+		}
+		key := call.Argument(0).String()
+
+		opts := limitOpts{}
+		if len(call.Arguments) > 1 {
+			if m, ok := call.Argument(1).Export().(map[string]interface{}); ok {
+				opts.Window = secondsField(m, "window")
+				opts.MaxCount = intField(m, "maxCount")
+				opts.TTL = secondsField(m, "ttl")
+				if v, ok := m["blacklist"].(bool); ok {
+					opts.Blacklist = v
+				}
+			}
+		}
+
+		// Misconfiguration → silently allow.
+		if opts.Window <= 0 || opts.MaxCount <= 0 || opts.TTL <= 0 {
+			return goja.Undefined()
+		}
+
+		if e.limiter.check(key, req.SourceIP, opts) {
+			return goja.Undefined()
+		}
+
+		// Denied: send the negative response and halt the script.
+		// The halt sentinel makes Engine.Execute return nil so the
+		// server does not also send a 500 / try to forward.
+		log.Printf("[script] limit hit: key=%q ip=%q window=%v maxCount=%d ttl=%v blacklist=%v",
+			key, req.SourceIP, opts.Window, opts.MaxCount, opts.TTL, opts.Blacklist)
+		e.proxy.SendResponse(req, 403, "Forbidden")
+		vm.Interrupt(scriptHalt{reason: "limit"})
 		return goja.Undefined()
 	})
 
@@ -640,6 +708,24 @@ func intField(m map[string]interface{}, key string) int {
 		return int(n)
 	case int:
 		return n
+	}
+	return 0
+}
+
+// secondsField parses a number-of-seconds field (window, ttl) from
+// a JS options object. Returns 0 if absent or not a number.
+func secondsField(m map[string]interface{}, key string) time.Duration {
+	v, ok := m[key]
+	if !ok {
+		return 0
+	}
+	switch n := v.(type) {
+	case int64:
+		return time.Duration(n) * time.Second
+	case float64:
+		return time.Duration(n) * time.Second
+	case int:
+		return time.Duration(n) * time.Second
 	}
 	return 0
 }

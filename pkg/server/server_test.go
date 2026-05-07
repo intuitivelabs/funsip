@@ -1296,6 +1296,76 @@ function onRequest(req) {
 // importing the package directly via a long path.
 func sdpParse(s string) (*sdp.SDP, error) { return sdp.Parse([]byte(s)) }
 
+// ---------- Rate-limit / blacklist (script `limit`) ----------
+
+func TestLimitDeniesAfterThresholdAndBlacklistsIP(t *testing.T) {
+	h := setupHarness(t)
+
+	// Limit: max 3 OPTIONS for the same From-URI within 1 hour;
+	// once tripped, deny for 1 hour AND blacklist the source IP.
+	if r := h.postText("/deploy", `function onRequest(req){
+        limit(req.ip + '#' + req.from.uri, {window: 3600, maxCount: 3, ttl: 3600, blacklist: true});
+        sendResponse(200, "OK");
+    }`); r["success"] != true {
+		t.Fatalf("deploy: %v", r)
+	}
+
+	// Send 4 OPTIONS with the same From URI; first three get 200,
+	// the fourth gets 403.
+	for i := 1; i <= 4; i++ {
+		msg := buildRequest("OPTIONS", "sip:test.local", h.clientAddr.Port,
+			"alice", "x", fmt.Sprintf("limit-%d", i), i, nil, "")
+		resp := h.sendSIP(msg)
+		code, _ := parseStatusLine(resp)
+		want := 200
+		if i == 4 {
+			want = 403
+		}
+		if code != want {
+			t.Errorf("hit %d: want %d, got %d\n%s", i, want, code, resp)
+		}
+	}
+
+	// After the limit trips, ANY request from the same IP — even a
+	// completely unrelated key (different From) — must be denied
+	// because blacklist:true was set.
+	other := buildRequest("OPTIONS", "sip:test.local", h.clientAddr.Port,
+		"different-user", "x", "limit-other", 99, nil, "")
+	resp := h.sendSIP(other)
+	code, _ := parseStatusLine(resp)
+	if code != 403 {
+		t.Errorf("blacklisted IP, unrelated key: want 403, got %d\n%s", code, resp)
+	}
+}
+
+func TestLimitWithoutBlacklistDoesNotAffectOtherKeys(t *testing.T) {
+	h := setupHarness(t)
+
+	if r := h.postText("/deploy", `function onRequest(req){
+        limit(req.from.uri, {window: 3600, maxCount: 2, ttl: 3600 /* no blacklist */});
+        sendResponse(200, "OK");
+    }`); r["success"] != true {
+		t.Fatalf("deploy: %v", r)
+	}
+
+	// Trip the limit on user "alice".
+	for i := 1; i <= 3; i++ {
+		msg := buildRequest("OPTIONS", "sip:test.local", h.clientAddr.Port,
+			"alice", "x", fmt.Sprintf("nobl-%d", i), i, nil, "")
+		h.sendSIP(msg)
+	}
+
+	// A request from the same IP but a different From URI must NOT
+	// be denied because blacklist was not set.
+	msg := buildRequest("OPTIONS", "sip:test.local", h.clientAddr.Port,
+		"bob", "x", "nobl-other", 99, nil, "")
+	resp := h.sendSIP(msg)
+	code, _ := parseStatusLine(resp)
+	if code != 200 {
+		t.Errorf("non-blacklisted limit must not affect a different From URI: want 200, got %d", code)
+	}
+}
+
 // ---------- Script & INVITE-transaction timeouts ----------
 
 func TestScriptTimeoutNonInvite(t *testing.T) {
