@@ -1,5 +1,9 @@
 // Package events emits SIP-domain events (call-start, call-end,
-// auth-failed, …) over HTTP POST to a configured collector URL.
+// auth-failed, …) over HTTP POST to a configured collector URL,
+// using the wire format from
+// github.com/intuitivelabs/sipcallmon / sipcmbeat — flat top-level
+// keys with dot-separated names that downstream consumers
+// (Elasticsearch, etc.) parse into nested objects.
 //
 // Emission is fire-and-forget: callers drop events onto a bounded
 // channel and a single worker goroutine drains the channel,
@@ -10,7 +14,10 @@ package events
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -21,201 +28,263 @@ import (
 	"github.com/intuitivelabs/funsip/pkg/store"
 )
 
-// Event mirrors the shape of the example events in
-// /Users/jirikuthan/tmp/eventsamples/* — a flat top-level "type",
-// "type2", "@timestamp" plus an "attrs" map and a nested "sip"
-// object. Probe-specific cruft (geoip, agent, dbg, rate, …) is
-// intentionally omitted — those are observability metadata for a
-// different pipeline.
-type Event struct {
-	Timestamp string                 `json:"@timestamp"`
-	Type      string                 `json:"type"`
-	Type2     string                 `json:"type2"`
-	Attrs     map[string]interface{} `json:"attrs"`
-	Client    *Endpoint              `json:"client,omitempty"`
-	Server    *Endpoint              `json:"server,omitempty"`
-	SIP       *SIPInfo               `json:"sip,omitempty"`
-	EventInfo map[string]interface{} `json:"event,omitempty"`
+// Event is a flat dotted-key envelope. The keys match the field
+// names used by sipcallmon/sipcmbeat so events emitted by funsip
+// can be ingested by the same downstream pipeline. A few examples
+// of the keys it carries:
+//
+//	type                 (event type: call-start, call-end, …)
+//	@timestamp
+//	sip.call_id
+//	sip.fromtag / sip.totag
+//	sip.request.method
+//	sip.request.sig      (compact request signature, see Signature())
+//	sip.response.status / sip.response.last
+//	sip.originator       (caller-terminated / callee-terminated / timeout-terminated)
+//	event.duration       (seconds, for call-end)
+//	event.media          (DTMF / QoS / WAV / PCAP report)
+//	event.filename       (for playAudio sessions)
+//	client.ip / client.port / client.transport
+//	attrs.aor / attrs.from / attrs.to / attrs.contact …
+type Event map[string]interface{}
+
+// Type returns the event-type label ("call-start", "auth-failed", …)
+// or "" if unset. Convenience helper for tests / collectors.
+func (e Event) Type() string {
+	if e == nil {
+		return ""
+	}
+	if v, ok := e["type"].(string); ok {
+		return v
+	}
+	return ""
 }
 
-type Endpoint struct {
-	IP        string `json:"ip,omitempty"`
-	Port      int    `json:"port,omitempty"`
-	Transport string `json:"transport,omitempty"`
-}
-
-type SIPInfo struct {
-	CallID     string        `json:"call_id,omitempty"`
-	Contact    string        `json:"contact,omitempty"`
-	From       string        `json:"from,omitempty"`
-	FromTag    string        `json:"fromtag,omitempty"`
-	To         string        `json:"to,omitempty"`
-	ToTag      string        `json:"totag,omitempty"`
-	Reason     string        `json:"sip_reason,omitempty"`
-	Originator string        `json:"originator,omitempty"`
-	Request    *RequestInfo  `json:"request,omitempty"`
-	Response   *ResponseInfo `json:"response,omitempty"`
-}
-
-type RequestInfo struct {
-	Method string `json:"method"`
-}
-
-type ResponseInfo struct {
-	Status int `json:"status"`
+// Set sets one dotted-key field. Returns the event for chaining.
+func (e Event) Set(key string, value interface{}) Event {
+	e[key] = value
+	return e
 }
 
 // ----- Builders -----
 
-// FromRequest returns an Event with the common attrs/sip/client
-// fields filled in from the SIP request.
-func FromRequest(eventType string, req *sip.Message) *Event {
+// FromRequest returns an Event with sip.* / client.* / attrs.*
+// populated from a SIP request. The caller fills in the response
+// fields (WithResponse) and duration (WithDuration) as appropriate.
+func FromRequest(eventType string, req *sip.Message) Event {
 	transport := strings.ToLower(req.Transport)
-	e := &Event{
-		Timestamp: now(),
-		Type:      "event",
-		Type2:     eventType,
-		Attrs: map[string]interface{}{
-			"type":      eventType,
-			"method":    req.Method,
-			"call-id":   req.CallID(),
-			"source":    req.SourceIP,
-			"src-port":  req.SourcePort,
-			"transport": transport,
-		},
-		Client: &Endpoint{
-			IP:        req.SourceIP,
-			Port:      req.SourcePort,
-			Transport: transport,
-		},
-		SIP: &SIPInfo{
-			CallID:  req.CallID(),
-			Request: &RequestInfo{Method: req.Method},
-		},
+	e := Event{
+		"@timestamp":          now(),
+		"type":                eventType,
+		"sip.call_id":         req.CallID(),
+		"sip.request.method":  req.Method,
+		"sip.request.sig":     Signature(req),
+		"client.ip":           req.SourceIP,
+		"client.port":         req.SourcePort,
+		"client.transport":    transport,
+		// attrs.* mirror the most useful identification fields so
+		// they can be queried without dragging in the full sip.* tree.
+		"attrs.method":     req.Method,
+		"attrs.call-id":    req.CallID(),
+		"attrs.source":     req.SourceIP,
+		"attrs.src-port":   req.SourcePort,
+		"attrs.transport":  transport,
 	}
 
 	if from := req.From(); from != nil && from.URI != nil {
-		e.Attrs["from"] = from.URI.String()
-		e.Attrs["from-domain"] = from.URI.Host
-		e.SIP.From = from.URI.String()
-		e.SIP.FromTag = from.Tag()
+		e["sip.from"] = from.URI.String()
+		e["sip.fromtag"] = from.Tag()
+		e["attrs.from"] = from.URI.String()
+		e["attrs.from-domain"] = from.URI.Host
 	}
 	if to := req.To(); to != nil && to.URI != nil {
-		e.Attrs["to"] = to.URI.String()
-		e.SIP.To = to.URI.String()
+		e["sip.to"] = to.URI.String()
 		if t := to.Tag(); t != "" {
-			e.SIP.ToTag = t
+			e["sip.totag"] = t
 		}
+		e["attrs.to"] = to.URI.String()
 	}
 	if req.RequestURI != nil {
-		e.Attrs["r-uri"] = req.RequestURI.String()
+		e["sip.request.uri"] = req.RequestURI.String()
+		e["attrs.r-uri"] = req.RequestURI.String()
 	}
 	if ua := req.Headers.Get("User-Agent"); ua != "" {
-		e.Attrs["from-ua"] = ua
+		e["sip.user_agent"] = ua
+		e["attrs.from-ua"] = ua
 	}
 	if cs := req.Contacts(); len(cs) > 0 && cs[0].URI != nil {
 		c := cs[0].URI.String()
-		e.Attrs["contact"] = c
-		e.SIP.Contact = c
+		e["sip.contact"] = c
+		e["attrs.contact"] = c
 	}
 	return e
 }
 
-// WithResponse adds the response status / reason fields.
-func (e *Event) WithResponse(statusCode int, reason string) *Event {
-	e.Attrs["sip-code"] = statusCode
-	e.Attrs["reason"] = reason
-	if e.SIP == nil {
-		e.SIP = &SIPInfo{}
-	}
-	e.SIP.Response = &ResponseInfo{Status: statusCode}
-	e.SIP.Reason = reason
+// WithResponse adds sip.response.status / sip.response.last / reason
+// (and the convenience attrs.sip-code mirror).
+func (e Event) WithResponse(statusCode int, reason string) Event {
+	e["sip.response.status"] = statusCode
+	e["sip.response.last"] = statusCode
+	e["sip.reason"] = reason
+	e["attrs.sip-code"] = statusCode
+	e["attrs.reason"] = reason
 	return e
 }
 
-// WithDuration adds call-end duration fields and the originator label
-// ("caller-terminated", "callee-terminated", "timeout").
-func (e *Event) WithDuration(d time.Duration, originator string) *Event {
+// WithDuration adds the call-end duration (seconds) and originator
+// label ("caller-terminated", "callee-terminated", "timeout-terminated").
+func (e Event) WithDuration(d time.Duration, originator string) Event {
 	secs := int64(d.Seconds())
-	e.Attrs["duration"] = secs
-	if e.EventInfo == nil {
-		e.EventInfo = map[string]interface{}{}
-	}
-	e.EventInfo["duration"] = secs
+	e["event.duration"] = secs
+	e["attrs.duration"] = secs
 	if originator != "" {
-		if e.SIP == nil {
-			e.SIP = &SIPInfo{}
-		}
-		e.SIP.Originator = originator
+		e["sip.originator"] = originator
 	}
 	return e
 }
 
-// FromBinding returns an Event for a registrar-emitted situation
-// (reg-new, reg-del, reg-expired). Optional `req` carries SIP-level
-// context for reg-new/reg-del; reg-expired typically has no request.
-func FromBinding(eventType string, b *store.Binding, req *sip.Message) *Event {
-	e := &Event{
-		Timestamp: now(),
-		Type:      "event",
-		Type2:     eventType,
-		Attrs: map[string]interface{}{
-			"type":      eventType,
-			"call-id":   b.CallID,
-			"contact":   b.Contact,
-			"source":    b.ReceivedIP,
-			"src-port":  b.ReceivedPort,
-			"transport": strings.ToLower(b.Transport),
-		},
-		Client: &Endpoint{
-			IP:        b.ReceivedIP,
-			Port:      b.ReceivedPort,
-			Transport: strings.ToLower(b.Transport),
-		},
-		SIP: &SIPInfo{
-			CallID:  b.CallID,
-			Contact: b.Contact,
-			Request: &RequestInfo{Method: "REGISTER"},
-		},
+// FromBinding builds an event for a registrar-emitted situation
+// (reg-new, reg-del, reg-expired). The originating SIP request is
+// optional and supplies extra context when available.
+func FromBinding(eventType string, b *store.Binding, req *sip.Message) Event {
+	e := Event{
+		"@timestamp":         now(),
+		"type":               eventType,
+		"sip.call_id":        b.CallID,
+		"sip.contact":        b.Contact,
+		"sip.request.method": "REGISTER",
+		"client.ip":          b.ReceivedIP,
+		"client.port":        b.ReceivedPort,
+		"client.transport":   strings.ToLower(b.Transport),
+		"attrs.aor":          b.AOR,
+		"attrs.call-id":      b.CallID,
+		"attrs.contact":      b.Contact,
+		"attrs.source":       b.ReceivedIP,
+		"attrs.src-port":     b.ReceivedPort,
+		"attrs.transport":    strings.ToLower(b.Transport),
 	}
 	if b.UserAgent != "" {
-		e.Attrs["from-ua"] = b.UserAgent
+		e["sip.user_agent"] = b.UserAgent
+		e["attrs.from-ua"] = b.UserAgent
 	}
-	e.Attrs["aor"] = b.AOR
 	if !b.ExpiresAt.IsZero() {
-		e.Attrs["expires_at"] = b.ExpiresAt.UTC().Format(time.RFC3339)
+		e["attrs.expires_at"] = b.ExpiresAt.UTC().Format(time.RFC3339)
 	}
 
 	if req != nil {
+		e["sip.request.sig"] = Signature(req)
 		if from := req.From(); from != nil && from.URI != nil {
-			e.Attrs["from"] = from.URI.String()
-			e.Attrs["from-domain"] = from.URI.Host
-			e.SIP.From = from.URI.String()
-			e.SIP.FromTag = from.Tag()
+			e["sip.from"] = from.URI.String()
+			e["sip.fromtag"] = from.Tag()
+			e["attrs.from"] = from.URI.String()
+			e["attrs.from-domain"] = from.URI.Host
 		}
 		if to := req.To(); to != nil && to.URI != nil {
-			e.Attrs["to"] = to.URI.String()
-			e.SIP.To = to.URI.String()
+			e["sip.to"] = to.URI.String()
+			e["attrs.to"] = to.URI.String()
 		}
 		if req.RequestURI != nil {
-			e.Attrs["r-uri"] = req.RequestURI.String()
+			e["sip.request.uri"] = req.RequestURI.String()
+			e["attrs.r-uri"] = req.RequestURI.String()
 		}
 	}
 	return e
+}
+
+// ----- Signature -----
+
+// Signature returns a compact stable fingerprint of a SIP request,
+// matching the *intent* (but not the exact byte format) of sipsp's
+// MsgSig: a short string that captures the method, the order and
+// case of the headers the UA chose, and structural digests of the
+// identity fields (Call-ID, From-tag, Via branch).
+//
+// Format:
+//
+//	<METHOD>:<hdrcodes>:<cidhash>
+//
+// where hdrcodes is a sequence of single letters per occurrence of
+// a recognized header in the order they appear in the request
+// (uppercase = long form, lowercase = compact form):
+//
+//	V/v = Via       F/f = From        T/t = To
+//	I/i = Call-ID   C   = CSeq        O/m = Contact
+//	M   = Max-Forwards    U   = User-Agent
+//
+// and cidhash is the first 12 hex digits of SHA-1 over
+// (method || call-id || from-tag || via-branch). Different UAs end
+// up with very different signatures; the same UA placing the same
+// call shape yields the same signature across calls.
+func Signature(req *sip.Message) string {
+	if req == nil {
+		return ""
+	}
+	var hdrCodes strings.Builder
+	for _, h := range req.Headers.Names() {
+		c := hdrCode(h)
+		if c == 0 {
+			continue
+		}
+		hdrCodes.WriteByte(c)
+	}
+
+	h := sha1.New()
+	h.Write([]byte(req.Method))
+	h.Write([]byte{0})
+	h.Write([]byte(req.CallID()))
+	h.Write([]byte{0})
+	if from := req.From(); from != nil {
+		h.Write([]byte(from.Tag()))
+	}
+	h.Write([]byte{0})
+	if via := req.TopVia(); via != nil {
+		h.Write([]byte(via.Branch()))
+	}
+	sum := hex.EncodeToString(h.Sum(nil))
+
+	return fmt.Sprintf("%s:%s:%s", req.Method, hdrCodes.String(), sum[:12])
+}
+
+// hdrCode returns the signature letter for a header name. Returns
+// 0 for headers we don't include in the signature.
+func hdrCode(name string) byte {
+	// The header-names list comes from the parser already
+	// canonicalized to long form (Headers.Names()), so we only need
+	// to map the long names. Compact-form detection would need a
+	// separate hook in the parser to remember the wire form.
+	switch strings.ToLower(name) {
+	case "via":
+		return 'V'
+	case "from":
+		return 'F'
+	case "to":
+		return 'T'
+	case "call-id":
+		return 'I'
+	case "cseq":
+		return 'C'
+	case "contact":
+		return 'O'
+	case "max-forwards":
+		return 'M'
+	case "user-agent":
+		return 'U'
+	}
+	return 0
 }
 
 // ----- Sink -----
 
 const defaultQueueSize = 1024
 
-// Sink is a non-blocking event-to-HTTP forwarder. Send() never
+// Sink is a non-blocking event-to-HTTP forwarder. Send never
 // blocks; on overflow the event is dropped and a counter
 // incremented. A single worker goroutine drains the queue and POSTs
 // each event as a JSON body to the configured URL.
 type Sink struct {
 	url   string
 	httpc *http.Client
-	queue chan *Event
+	queue chan Event
 	done  chan struct{}
 
 	closed   atomic.Bool
@@ -232,7 +301,7 @@ func NewSink(url string) *Sink {
 	s := &Sink{
 		url:   strings.TrimSpace(url),
 		httpc: &http.Client{Timeout: 5 * time.Second},
-		queue: make(chan *Event, defaultQueueSize),
+		queue: make(chan Event, defaultQueueSize),
 		done:  make(chan struct{}),
 	}
 	go s.worker()
@@ -242,7 +311,7 @@ func NewSink(url string) *Sink {
 // Send attempts to enqueue an event. Returns immediately. Drops
 // silently if the queue is full, the sink is closed, or the URL is
 // not configured.
-func (s *Sink) Send(e *Event) {
+func (s *Sink) Send(e Event) {
 	if s == nil || e == nil {
 		return
 	}
@@ -264,7 +333,7 @@ func (s *Sink) worker() {
 	close(s.done)
 }
 
-func (s *Sink) post(e *Event) {
+func (s *Sink) post(e Event) {
 	body, err := json.Marshal(e)
 	if err != nil {
 		s.failed.Add(1)
@@ -290,7 +359,7 @@ func (s *Sink) post(e *Event) {
 }
 
 // Close stops the worker after draining whatever is already in the
-// queue. Subsequent Send() calls are no-ops.
+// queue. Subsequent Send calls are no-ops.
 func (s *Sink) Close() {
 	if s.closed.Swap(true) {
 		return

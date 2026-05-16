@@ -33,6 +33,23 @@ func (h *Headers) Clone() *Headers {
 	return c
 }
 
+// Names returns the canonical header names in arrival order, one
+// entry per *occurrence* (so a Via header that appeared twice is
+// listed twice). Used by the events signature computation to record
+// the header order the UA emitted.
+func (h *Headers) Names() []string {
+	if h == nil {
+		return nil
+	}
+	out := make([]string, 0, len(h.ordered)*2)
+	for _, e := range h.ordered {
+		for range e.values {
+			out = append(out, e.name)
+		}
+	}
+	return out
+}
+
 func (h *Headers) Get(name string) string {
 	key := strings.ToLower(name)
 	if idx, ok := h.index[key]; ok {

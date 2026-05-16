@@ -127,9 +127,25 @@ type Dialog struct {
 
 	cseq atomic.Int64
 
+	// playFilename is set when the dialog was answered locally with
+	// playAudio(); it gets attached to the call-start / call-end
+	// events under the "event.filename" key.
+	playFilename string
+
 	manager *Manager
 
 	mu sync.Mutex
+}
+
+// SetPlayFilename records the audio filename the call is playing.
+// The dialog manager surfaces it via the call-end event.
+func (d *Dialog) SetPlayFilename(name string) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	d.playFilename = name
+	d.mu.Unlock()
 }
 
 type side struct {
@@ -318,11 +334,11 @@ func (m *Manager) Terminate(callID string, byeReq *sip.Message) bool {
 			WithDuration(time.Since(d.createdAt), originator)
 		if m.mediaReport != nil {
 			if rep := m.mediaReport(callID); rep != nil {
-				if ev.EventInfo == nil {
-					ev.EventInfo = map[string]interface{}{}
-				}
-				ev.EventInfo["media"] = rep
+				ev["event.media"] = rep
 			}
+		}
+		if d.playFilename != "" {
+			ev["event.filename"] = d.playFilename
 		}
 		m.events.Send(ev)
 	}
@@ -423,10 +439,10 @@ func (m *Manager) fireTimeout(d *Dialog) {
 	if m.events != nil {
 		ev := buildCallEndFromDialog(d, "timeout")
 		if mediaRep != nil {
-			if ev.EventInfo == nil {
-				ev.EventInfo = map[string]interface{}{}
-			}
-			ev.EventInfo["media"] = mediaRep
+			ev["event.media"] = mediaRep
+		}
+		if d.playFilename != "" {
+			ev["event.filename"] = d.playFilename
 		}
 		m.events.Send(ev)
 	}
@@ -441,47 +457,42 @@ func (m *Manager) fireTimeout(d *Dialog) {
 
 // buildCallEndFromDialog synthesizes a call-end event from dialog
 // state alone (no SIP request available). Used by the timeout path.
-func buildCallEndFromDialog(d *Dialog, originator string) *events.Event {
+func buildCallEndFromDialog(d *Dialog, originator string) events.Event {
 	d.mu.Lock()
 	caller := d.caller
 	callee := d.callee
 	d.mu.Unlock()
 
-	ev := &events.Event{
-		Timestamp: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
-		Type:      "event",
-		Type2:     "call-end",
-		Attrs: map[string]interface{}{
-			"type":    "call-end",
-			"call-id": d.CallID,
-			"method":  "INVITE",
-		},
-		SIP: &events.SIPInfo{
-			CallID:     d.CallID,
-			Originator: originator,
-			Request:    &events.RequestInfo{Method: "INVITE"},
-		},
+	ev := events.Event{
+		"@timestamp":         time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+		"type":               "call-end",
+		"sip.call_id":        d.CallID,
+		"sip.request.method": "INVITE",
+		"sip.originator":     originator,
+		"attrs.call-id":      d.CallID,
+		"attrs.method":       "INVITE",
 	}
 	if caller != nil {
 		if caller.AOR != nil {
-			ev.Attrs["from"] = caller.AOR.String()
-			ev.Attrs["from-domain"] = caller.AOR.Host
-			ev.SIP.From = caller.AOR.String()
+			ev["sip.from"] = caller.AOR.String()
+			ev["attrs.from"] = caller.AOR.String()
+			ev["attrs.from-domain"] = caller.AOR.Host
 		}
-		ev.SIP.FromTag = caller.Tag
-		ev.Attrs["source"] = stripPort(caller.Addr)
-		ev.Attrs["transport"] = caller.Transport
+		ev["sip.fromtag"] = caller.Tag
+		ev["attrs.source"] = stripPort(caller.Addr)
+		ev["attrs.transport"] = caller.Transport
+		ev["client.transport"] = caller.Transport
 	}
 	if callee != nil {
 		if callee.AOR != nil {
-			ev.Attrs["to"] = callee.AOR.String()
-			ev.SIP.To = callee.AOR.String()
+			ev["sip.to"] = callee.AOR.String()
+			ev["attrs.to"] = callee.AOR.String()
 		}
-		ev.SIP.ToTag = callee.Tag
+		ev["sip.totag"] = callee.Tag
 	}
 	secs := int64(time.Since(d.createdAt).Seconds())
-	ev.Attrs["duration"] = secs
-	ev.EventInfo = map[string]interface{}{"duration": secs}
+	ev["event.duration"] = secs
+	ev["attrs.duration"] = secs
 	return ev
 }
 

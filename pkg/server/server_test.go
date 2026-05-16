@@ -1733,9 +1733,9 @@ func TestAnalyzerDTMFAndQoSInCallEnd(t *testing.T) {
 	}
 
 	ev := waitForEvent(t, evCh, "call-end", 3*time.Second)
-	mediaRaw, ok := ev.EventInfo["media"]
+	mediaRaw, ok := ev["event.media"]
 	if !ok {
-		t.Fatalf("call-end event has no event.media field: %+v", ev.EventInfo)
+		t.Fatalf("call-end event has no event.media field: %+v", ev)
 	}
 	mediaMap, ok := mediaRaw.(map[string]interface{})
 	if !ok {
@@ -1828,15 +1828,15 @@ func TestAnalyzerDTMFAndQoSInCallEnd(t *testing.T) {
 // that POSTs to a local httptest.Server. Returned channel receives
 // every event the proxy/registrar/dialog manager emits while the
 // test is running.
-func attachEventCollector(t *testing.T, h *harness) <-chan *events.Event {
+func attachEventCollector(t *testing.T, h *harness) <-chan events.Event {
 	t.Helper()
-	ch := make(chan *events.Event, 32)
+	ch := make(chan events.Event, 32)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		var ev events.Event
+		ev := events.Event{}
 		if err := json.Unmarshal(body, &ev); err == nil {
 			select {
-			case ch <- &ev:
+			case ch <- ev:
 			default:
 			}
 		}
@@ -1856,17 +1856,17 @@ func attachEventCollector(t *testing.T, h *harness) <-chan *events.Event {
 	return ch
 }
 
-// waitForEvent reads from ch until an event with type2 == want is
-// seen or the deadline elapses. Other types in flight are silently
-// drained.
-func waitForEvent(t *testing.T, ch <-chan *events.Event, want string, timeout time.Duration) *events.Event {
+// waitForEvent reads from ch until an event whose "type" key matches
+// `want` is seen or the deadline elapses. Other types in flight are
+// silently drained.
+func waitForEvent(t *testing.T, ch <-chan events.Event, want string, timeout time.Duration) events.Event {
 	t.Helper()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	for {
 		select {
 		case ev := <-ch:
-			if ev.Type2 == want {
+			if ev.Type() == want {
 				return ev
 			}
 		case <-timer.C:
@@ -1891,14 +1891,14 @@ func TestEventAuthFailed(t *testing.T) {
 	}
 
 	ev := waitForEvent(t, evCh, "auth-failed", 2*time.Second)
-	if ev.Attrs["sip-code"] != float64(401) {
-		t.Errorf("auth-failed event sip-code: want 401, got %v", ev.Attrs["sip-code"])
+	if ev["sip.response.status"] != float64(401) {
+		t.Errorf("auth-failed sip.response.status: want 401, got %v", ev["sip.response.status"])
 	}
-	if ev.Attrs["method"] != "REGISTER" {
-		t.Errorf("auth-failed event method: want REGISTER, got %v", ev.Attrs["method"])
+	if ev["sip.request.method"] != "REGISTER" {
+		t.Errorf("auth-failed sip.request.method: want REGISTER, got %v", ev["sip.request.method"])
 	}
-	if ev.SIP == nil || ev.SIP.Response == nil || ev.SIP.Response.Status != 401 {
-		t.Errorf("auth-failed sip.response.status: %#v", ev.SIP)
+	if _, ok := ev["sip.request.sig"].(string); !ok {
+		t.Errorf("auth-failed event missing sip.request.sig: %v", ev["sip.request.sig"])
 	}
 }
 
@@ -1943,11 +1943,11 @@ func TestEventCallAttempt(t *testing.T) {
 	}
 
 	ev := waitForEvent(t, evCh, "call-attempt", 2*time.Second)
-	if ev.Attrs["sip-code"] != float64(486) {
-		t.Errorf("call-attempt sip-code: want 486, got %v", ev.Attrs["sip-code"])
+	if ev["sip.response.status"] != float64(486) {
+		t.Errorf("call-attempt sip.response.status: want 486, got %v", ev["sip.response.status"])
 	}
-	if ev.Attrs["method"] != "INVITE" {
-		t.Errorf("call-attempt method: want INVITE, got %v", ev.Attrs["method"])
+	if ev["sip.request.method"] != "INVITE" {
+		t.Errorf("call-attempt sip.request.method: want INVITE, got %v", ev["sip.request.method"])
 	}
 }
 
@@ -1967,8 +1967,8 @@ func TestEventCallStart(t *testing.T) {
 	}
 
 	ev := waitForEvent(t, evCh, "call-start", 2*time.Second)
-	if ev.Attrs["sip-code"] != float64(200) {
-		t.Errorf("call-start sip-code: want 200, got %v", ev.Attrs["sip-code"])
+	if ev["sip.response.status"] != float64(200) {
+		t.Errorf("call-start sip.response.status: want 200, got %v", ev["sip.response.status"])
 	}
 }
 
@@ -2032,11 +2032,11 @@ func TestEventCallEndOnBYE(t *testing.T) {
 	}
 
 	ev := waitForEvent(t, evCh, "call-end", 2*time.Second)
-	if ev.Attrs["call-id"] != callID {
-		t.Errorf("call-end call-id: want %q, got %v", callID, ev.Attrs["call-id"])
+	if ev["sip.call_id"] != callID {
+		t.Errorf("call-end sip.call_id: want %q, got %v", callID, ev["sip.call_id"])
 	}
-	if ev.SIP == nil || ev.SIP.Originator != "caller-terminated" {
-		t.Errorf("call-end originator: want caller-terminated, got %#v", ev.SIP)
+	if ev["sip.originator"] != "caller-terminated" {
+		t.Errorf("call-end sip.originator: want caller-terminated, got %v", ev["sip.originator"])
 	}
 }
 
@@ -2048,10 +2048,10 @@ func TestEventRegNew(t *testing.T) {
 	registerUser(t, h, "alice", "secret", "ev-regnew", 1)
 
 	ev := waitForEvent(t, evCh, "reg-new", 2*time.Second)
-	if ev.Attrs["aor"] != "sip:alice@test.local" {
-		t.Errorf("reg-new aor: %v", ev.Attrs["aor"])
+	if ev["attrs.aor"] != "sip:alice@test.local" {
+		t.Errorf("reg-new attrs.aor: %v", ev["attrs.aor"])
 	}
-	if ev.SIP == nil || ev.SIP.Contact == "" {
+	if ev["sip.contact"] == nil || ev["sip.contact"] == "" {
 		t.Errorf("reg-new sip.contact missing")
 	}
 }
@@ -2069,8 +2069,8 @@ func TestEventRegDel(t *testing.T) {
 	deRegister(t, h, "alice", "secret", "ev-regdel-off", 3)
 
 	ev := waitForEvent(t, evCh, "reg-del", 2*time.Second)
-	if ev.Attrs["aor"] != "sip:alice@test.local" {
-		t.Errorf("reg-del aor: %v", ev.Attrs["aor"])
+	if ev["attrs.aor"] != "sip:alice@test.local" {
+		t.Errorf("reg-del attrs.aor: %v", ev["attrs.aor"])
 	}
 }
 
@@ -2094,8 +2094,8 @@ func TestEventRegExpired(t *testing.T) {
 	h.srv.Registrar.SweepExpired()
 
 	ev := waitForEvent(t, evCh, "reg-expired", 2*time.Second)
-	if ev.Attrs["aor"] != "sip:gone@test.local" {
-		t.Errorf("reg-expired aor: %v", ev.Attrs["aor"])
+	if ev["attrs.aor"] != "sip:gone@test.local" {
+		t.Errorf("reg-expired attrs.aor: %v", ev["attrs.aor"])
 	}
 }
 
