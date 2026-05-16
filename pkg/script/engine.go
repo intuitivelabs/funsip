@@ -463,6 +463,43 @@ func (e *Engine) registerFunctions(vm *goja.Runtime, req *sip.Message) {
 		return goja.Undefined()
 	})
 
+	vm.Set("playAudio", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			log.Printf("[script] playAudio: missing filename")
+			return goja.Undefined()
+		}
+		filename := call.Argument(0).String()
+
+		var ringing time.Duration
+		if len(call.Arguments) > 1 {
+			if m, ok := call.Argument(1).Export().(map[string]interface{}); ok {
+				ringing = secondsField(m, "ringingTime")
+			}
+		}
+
+		if err := e.proxy.PlayAudio(req, filename, ringing); err != nil {
+			log.Printf("[script] playAudio error: %v", err)
+			e.proxy.SendResponse(req, 500, "Server Internal Error")
+			vm.Interrupt(scriptHalt{reason: "playAudio-error"})
+			return goja.Undefined()
+		}
+
+		// Remember the filename on the dialog so the call-end event
+		// surfaces it later. If the script did not call
+		// setupDialog, this is a no-op (the dialog manager doesn't
+		// track the call and won't emit call-end).
+		if e.dialogs != nil {
+			if d := e.dialogs.FindFor(req); d != nil {
+				d.SetPlayFilename(filename)
+			}
+		}
+
+		// playAudio handles the SIP signaling end-to-end; the rest
+		// of the script must not run (no proxy(), no sendResponse).
+		vm.Interrupt(scriptHalt{reason: "playAudio"})
+		return goja.Undefined()
+	})
+
 	vm.Set("anchorMedia", func(call goja.FunctionCall) goja.Value {
 		opts := media.DefaultOptions()
 		if len(call.Arguments) > 0 {

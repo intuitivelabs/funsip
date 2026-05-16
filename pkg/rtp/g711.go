@@ -67,6 +67,74 @@ func DecodePCMA(in []byte) []int16 {
 	return out
 }
 
+// EncodePCMU compresses a slice of 16-bit linear PCM samples into
+// G.711 µ-law bytes (one byte per sample). Used by the audio player
+// when reading a 16-bit PCM WAV file and sending it as PT=0 RTP.
+func EncodePCMU(in []int16) []byte {
+	out := make([]byte, len(in))
+	for i, s := range in {
+		out[i] = ulawEncodeOne(s)
+	}
+	return out
+}
+
+// EncodePCMA is the A-law counterpart of EncodePCMU.
+func EncodePCMA(in []int16) []byte {
+	out := make([]byte, len(in))
+	for i, s := range in {
+		out[i] = alawEncodeOne(s)
+	}
+	return out
+}
+
+func ulawEncodeOne(s int16) byte {
+	const bias = 0x84
+	const clip = 32635
+	sign := byte(0)
+	v := int32(s)
+	if v < 0 {
+		v = -v
+		sign = 0x80
+	}
+	if v > clip {
+		v = clip
+	}
+	v += bias
+	exp := byte(7)
+	for mask := int32(0x4000); mask&v == 0 && exp > 0; mask >>= 1 {
+		exp--
+	}
+	mantissa := byte((v >> (uint(exp) + 3)) & 0x0F)
+	u := ^(sign | (exp << 4) | mantissa)
+	return u
+}
+
+func alawEncodeOne(s int16) byte {
+	v := int32(s)
+	sign := byte(0)
+	if v < 0 {
+		v = -v - 1
+		sign = 0x80
+	} else {
+		sign = 0
+	}
+	if v > 32767 {
+		v = 32767
+	}
+	var compressed byte
+	if v < 256 {
+		compressed = byte(v >> 4)
+	} else {
+		exp := byte(1)
+		for x := v >> 8; x > 1; x >>= 1 {
+			exp++
+		}
+		mantissa := byte((v >> (uint(exp) + 3)) & 0x0F)
+		compressed = (exp << 4) | mantissa
+	}
+	return (sign | compressed) ^ 0x55
+}
+
 // IsAudioPT reports whether the static RTP/AVP payload type is one
 // the decoder supports.
 func IsAudioPT(pt uint8) bool {

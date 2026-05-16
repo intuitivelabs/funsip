@@ -14,6 +14,7 @@ import (
 	"github.com/intuitivelabs/funsip/pkg/management"
 	"github.com/intuitivelabs/funsip/pkg/media"
 	"github.com/intuitivelabs/funsip/pkg/metrics"
+	"github.com/intuitivelabs/funsip/pkg/play"
 	"github.com/intuitivelabs/funsip/pkg/proxy"
 	"github.com/intuitivelabs/funsip/pkg/registrar"
 	"github.com/intuitivelabs/funsip/pkg/script"
@@ -37,6 +38,7 @@ type Server struct {
 	Media     *media.Manager
 	Dialogs   *dialog.Manager
 	Events    *events.Sink
+	Play      *play.Manager
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -56,6 +58,8 @@ func New(cfg *config.Config) (*Server, error) {
 	s.Media = media.NewManager(cfg.ListenIP)
 	s.Proxy.SetMediaManager(s.Media)
 	s.Proxy.SetMediaDir(cfg.PCAPDir)
+	s.Play = play.NewManager(cfg.ListenIP)
+	s.Proxy.SetPlayManager(s.Play)
 	s.Registrar = registrar.New(db)
 	s.Auth = auth.NewDigestAuth(db, cfg.Domain)
 	s.Dialogs = dialog.NewManager(s.Transport, s.Metrics, cfg.ListenIP, cfg.ListenPort, cfg.PCAPDir)
@@ -101,14 +105,33 @@ func New(cfg *config.Config) (*Server, error) {
 			d := s.Dialogs.FindFor(req)
 
 			if req.Method == "BYE" {
+				// Locally-anchored call (playAudio): we ARE the UAS —
+				// the BYE must NOT be forwarded; we just answer 200
+				// and tear down the play session.
+				if s.Play.Get(req.CallID()) != nil {
+					if d != nil {
+						s.Dialogs.Terminate(req.CallID(), req)
+					}
+					s.Play.CleanupForCallID(req.CallID())
+					s.Proxy.SendResponse(req, 200, "OK")
+					return
+				}
+
 				if d != nil {
 					s.Dialogs.Terminate(req.CallID(), req)
 				}
 				s.Proxy.CleanupMediaForCallID(req.CallID())
+				s.Play.CleanupForCallID(req.CallID())
 				if err := s.Proxy.ForwardInDialog(req); err != nil {
 					log.Printf("[server] BYE forward error: %v", err)
 					s.Proxy.SendResponse(req, 500, "Server Internal Error")
 				}
+				return
+			}
+
+			// ACKs for locally-anchored calls are absorbed silently;
+			// the IST's ACK handling already drops them on the floor.
+			if req.Method == "ACK" && s.Play.Get(req.CallID()) != nil {
 				return
 			}
 

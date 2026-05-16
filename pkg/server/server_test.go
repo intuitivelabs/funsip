@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/md5"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -1295,6 +1296,186 @@ function onRequest(req) {
 // sdpParse is a tiny shim so the test file can call sdp.Parse without
 // importing the package directly via a long path.
 func sdpParse(s string) (*sdp.SDP, error) { return sdp.Parse([]byte(s)) }
+
+// ---------- playAudio ----------
+
+// writeULawWav generates a tiny 8 kHz µ-law mono WAV file (160
+// samples = 20 ms, value 0x00 = loud sample) so the player has
+// something well-formed to send.
+func writeULawWav(t *testing.T, path string, frames int) {
+	t.Helper()
+	const samplesPerFrame = 160
+	dataBytes := frames * samplesPerFrame
+	total := 44 + dataBytes
+
+	buf := make([]byte, total)
+	copy(buf[0:4], "RIFF")
+	// little-endian RIFF size = total - 8
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(total-8))
+	copy(buf[8:12], "WAVE")
+	copy(buf[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(buf[16:20], 16)   // fmt chunk size
+	binary.LittleEndian.PutUint16(buf[20:22], 7)    // µ-law
+	binary.LittleEndian.PutUint16(buf[22:24], 1)    // mono
+	binary.LittleEndian.PutUint32(buf[24:28], 8000) // sample rate
+	binary.LittleEndian.PutUint32(buf[28:32], 8000) // byte rate
+	binary.LittleEndian.PutUint16(buf[32:34], 1)    // block align
+	binary.LittleEndian.PutUint16(buf[34:36], 8)    // bits per sample
+	copy(buf[36:40], "data")
+	binary.LittleEndian.PutUint32(buf[40:44], uint32(dataBytes))
+	// data: 0x80 is a moderate µ-law sample so the bytes are non-
+	// zero and recognizable.
+	for i := 44; i < total; i++ {
+		buf[i] = 0x80
+	}
+	if err := os.WriteFile(path, buf, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPlayAudioAnswersInviteAndStreamsRTP(t *testing.T) {
+	h := setupHarness(t)
+	evCh := attachEventCollector(t, h)
+
+	// Caller's RTP listener.
+	rtpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rtpConn.Close()
+	callerRtpPort := rtpConn.LocalAddr().(*net.UDPAddr).Port
+
+	// Tiny WAV with 50 frames = 1 second of audio.
+	tmpDir, err := os.MkdirTemp("", "funsip-play-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	wavPath := filepath.Join(tmpDir, "prompt.wav")
+	writeULawWav(t, wavPath, 50)
+
+	script := fmt.Sprintf(`function onRequest(req){
+        if (req.method === "INVITE") {
+            setupDialog({});
+            playAudio(%q, {ringingTime: 0});
+            return;
+        }
+        sendResponse(200, "OK");
+    }`, wavPath)
+	if r := h.postText("/deploy", script); r["success"] != true {
+		t.Fatalf("deploy: %v", r)
+	}
+
+	callID := "play-1"
+	branch := "z9hG4bK-play"
+	fromTag := "alice-play"
+	offer := fmt.Sprintf(
+		"v=0\r\no=alice 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio %d RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+		callerRtpPort,
+	)
+	invite := buildRequestExplicit("INVITE", "sip:bob@test.local", h.clientAddr.Port,
+		"alice", "bob", callID, 1, branch, fromTag,
+		[]string{
+			fmt.Sprintf("Contact: <sip:alice@127.0.0.1:%d>", h.clientAddr.Port),
+			"Content-Type: application/sdp",
+			fmt.Sprintf("Content-Length: %d", len(offer)),
+		}, offer)
+
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.sipPort}
+	if _, err := h.clientConn.WriteToUDP([]byte(invite), target); err != nil {
+		t.Fatal(err)
+	}
+
+	// Expect 100 Trying (auto), then 180 Ringing, then 200 OK.
+	gotRinging := false
+	gotOK := false
+	deadline := time.Now().Add(3 * time.Second)
+	var ok200Headers string
+	for time.Now().Before(deadline) && (!gotRinging || !gotOK) {
+		h.clientConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		buf := make([]byte, 65535)
+		n, _, err := h.clientConn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		msg := string(buf[:n])
+		code, _ := parseStatusLine(msg)
+		switch code {
+		case 180:
+			gotRinging = true
+		case 200:
+			gotOK = true
+			ok200Headers = msg
+		}
+	}
+	if !gotRinging {
+		t.Error("did not receive 180 Ringing")
+	}
+	if !gotOK {
+		t.Fatal("did not receive 200 OK")
+	}
+
+	// 200 OK must carry an SDP that points at our local relay,
+	// with PCMU.
+	if !strings.Contains(ok200Headers, "m=audio") || !strings.Contains(ok200Headers, "RTP/AVP 0") {
+		t.Errorf("200 OK missing PCMU SDP:\n%s", ok200Headers)
+	}
+
+	// Read at least a few RTP packets on the caller's port.
+	rtpConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	count := 0
+	rtpBuf := make([]byte, 2048)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && count < 3 {
+		rtpConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		n, _, err := rtpConn.ReadFromUDP(rtpBuf)
+		if err != nil {
+			continue
+		}
+		if n >= 12 && rtpBuf[0]&0xc0 == 0x80 && rtpBuf[1]&0x7f == 0 {
+			// RTPv2, PT=0 (PCMU)
+			count++
+		}
+	}
+	if count < 3 {
+		t.Errorf("received %d RTP packets from player, want >=3", count)
+	}
+
+	// Verify call-start event carries the filename.
+	startEv := waitForEvent(t, evCh, "call-start", 3*time.Second)
+	if startEv["event.filename"] != wavPath {
+		t.Errorf("call-start event.filename: want %q, got %v", wavPath, startEv["event.filename"])
+	}
+
+	// Extract the To-tag the 200 OK assigned us, so we can send a
+	// well-formed in-dialog BYE.
+	toHdr := extractHeader(ok200Headers, "To")
+	toTag := extractAuthParam(toHdr, "tag")
+	if toTag == "" {
+		t.Fatalf("200 OK did not carry a To-tag (RFC3261 §12.1.1):\n%s", ok200Headers)
+	}
+
+	// Send BYE — locally-anchored: we expect a 200 OK back, NOT a
+	// forward upstream.
+	bye := buildInDialogRequest("BYE", "sip:funsip@127.0.0.1", h.clientAddr.Port,
+		"alice", "funsip", callID, 2, "z9hG4bK-play-bye", fromTag, toTag,
+		nil, "")
+	if _, err := h.clientConn.WriteToUDP([]byte(bye), target); err != nil {
+		t.Fatal(err)
+	}
+
+	// And call-end carries filename too.
+	endEv := waitForEvent(t, evCh, "call-end", 3*time.Second)
+	if endEv["event.filename"] != wavPath {
+		t.Errorf("call-end event.filename: want %q, got %v", wavPath, endEv["event.filename"])
+	}
+
+	// After BYE, the play session should be gone.
+	time.Sleep(100 * time.Millisecond)
+	if got := h.srv.Play.ActiveCount(); got != 0 {
+		t.Errorf("play sessions after BYE: want 0, got %d", got)
+	}
+}
 
 // ---------- Rate-limit / blacklist (script `limit`) ----------
 

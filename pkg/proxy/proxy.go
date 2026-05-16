@@ -11,6 +11,7 @@ import (
 	"github.com/intuitivelabs/funsip/pkg/events"
 	"github.com/intuitivelabs/funsip/pkg/media"
 	"github.com/intuitivelabs/funsip/pkg/metrics"
+	"github.com/intuitivelabs/funsip/pkg/play"
 	"github.com/intuitivelabs/funsip/pkg/sdp"
 	"github.com/intuitivelabs/funsip/pkg/sip"
 	"github.com/intuitivelabs/funsip/pkg/store"
@@ -24,6 +25,7 @@ type Proxy struct {
 	domain    string
 	metrics   *metrics.Metrics
 	media     *media.Manager
+	plays     *play.Manager
 	events    *events.Sink
 	mediaDir  string
 
@@ -49,6 +51,117 @@ func New(txLayer *transaction.Layer, localIP string, localPort int, domain strin
 
 func (p *Proxy) SetMediaManager(m *media.Manager) { p.media = m }
 func (p *Proxy) MediaManager() *media.Manager     { return p.media }
+
+func (p *Proxy) SetPlayManager(m *play.Manager) { p.plays = m }
+func (p *Proxy) PlayManager() *play.Manager     { return p.plays }
+
+// PlayAudio answers an incoming INVITE locally with an audio file.
+// Sequence:
+//
+//  1. Send 180 Ringing immediately.
+//  2. Wait `ringingTime`.
+//  3. Allocate a play.Session and construct a 200 OK with the
+//     session's SDP.
+//  4. Send 200 OK; the IST absorbs the ACK.
+//  5. Parse the caller's offer SDP to find their RTP destination
+//     and start streaming.
+//
+// The session is registered in play.Manager keyed by Call-ID, so the
+// server's request handler tears it down on BYE.
+//
+// Emits "call-start" when 200 OK goes out, carrying the filename
+// under event.filename so downstream pipelines can correlate
+// recorded calls with the played-back audio.
+func (p *Proxy) PlayAudio(req *sip.Message, filename string, ringingTime time.Duration) error {
+	if p.plays == nil {
+		return fmt.Errorf("play manager not configured")
+	}
+	if req.Method != "INVITE" {
+		return fmt.Errorf("playAudio: only INVITE is supported")
+	}
+
+	sess, err := p.plays.Open(req.CallID(), filename)
+	if err != nil {
+		return fmt.Errorf("open audio: %w", err)
+	}
+
+	// Parse caller's offer SDP to find where to send RTP. If parsing
+	// fails or there is no SDP we still answer — the session simply
+	// has no destination until/unless someone sets one.
+	if dest := callerRTPDest(req); dest != nil {
+		sess.SetDestination(dest)
+	}
+
+	// 180 Ringing immediately.
+	ringing := sip.CreateResponseFromRequest(req, 180, "Ringing")
+	p.txLayer.RespondToRequest(req, ringing)
+
+	go func() {
+		if ringingTime > 0 {
+			time.Sleep(ringingTime)
+		}
+		ok := sip.CreateResponseFromRequest(req, 200, "OK")
+		// A 2xx response to an INVITE MUST carry a To-tag (RFC3261
+		// §12.1.1). Without it the UAC has no way to build a
+		// well-formed in-dialog BYE. We derive a deterministic
+		// To-tag from the SSRC + Call-ID so it stays stable across
+		// retransmits of the same response.
+		toTag := fmt.Sprintf("funsip-%x", sess.SSRC())
+		toHdr := ok.Headers.Get("To")
+		if !strings.Contains(toHdr, ";tag=") {
+			ok.Headers.Set("To", toHdr+";tag="+toTag)
+		}
+		body := sess.SDPBody()
+		ok.Body = body
+		ok.Headers.Set("Content-Type", "application/sdp")
+		ok.Headers.Set("Content-Length", strconv.Itoa(len(body)))
+		// Contact must point to where in-dialog requests should be
+		// sent: us. Without it many UACs send BYE to the wrong
+		// destination.
+		ok.Headers.Set("Contact", fmt.Sprintf("<sip:funsip@%s:%d>", p.localIP, p.localPort))
+		p.recordFinalDelay(req, 200)
+		p.txLayer.RespondToRequest(req, ok)
+		sess.Start()
+
+		if p.events != nil {
+			ev := events.FromRequest("call-start", req).WithResponse(200, "OK")
+			ev["event.filename"] = filename
+			p.events.Send(ev)
+		}
+	}()
+	return nil
+}
+
+// callerRTPDest parses the SDP body of req and returns the RTP
+// address advertised in the first m=audio line, or nil if none.
+func callerRTPDest(req *sip.Message) *net.UDPAddr {
+	if len(req.Body) == 0 {
+		return nil
+	}
+	parsed, err := sdp.Parse(req.Body)
+	if err != nil {
+		return nil
+	}
+	sessionAddr := ""
+	if parsed.Connection != nil {
+		sessionAddr = parsed.Connection.Address
+	}
+	for _, m := range parsed.Media {
+		if m.Type != "audio" || m.Port == 0 {
+			continue
+		}
+		addr := sessionAddr
+		if m.Connection != nil {
+			addr = m.Connection.Address
+		}
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			continue
+		}
+		return &net.UDPAddr{IP: ip, Port: m.Port}
+	}
+	return nil
+}
 
 // SetDialogConfirm registers a callback invoked once per response
 // just before it is forwarded back to the original sender. Used by
